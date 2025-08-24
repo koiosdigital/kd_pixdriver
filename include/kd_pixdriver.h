@@ -57,8 +57,8 @@ struct ChannelConfig {
     uint32_t resolution_hz = 10000000;  // 10MHz default
     std::string name;
 
-    ChannelConfig(gpio_num_t gpio_pin, uint16_t count, PixelFormat fmt = PixelFormat::RGB)
-        : pin(gpio_pin), pixel_count(count), format(fmt) {
+    ChannelConfig(gpio_num_t gpio_pin, uint16_t count, PixelFormat fmt = PixelFormat::RGB, const std::string& channel_name = "")
+        : pin(gpio_pin), pixel_count(count), format(fmt), name(channel_name) {
     }
 };
 
