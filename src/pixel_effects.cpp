@@ -7,6 +7,7 @@
 #include <utility>
 #include <unordered_map>
 #include <functional>
+#include <cctype>
 
 PixelEffectEngine::PixelEffectEngine(uint32_t update_rate_hz)
     : update_rate_hz_(update_rate_hz) {
@@ -46,9 +47,29 @@ void PixelEffectEngine::updateEffect(PixelChannel* channel, uint32_t tick) {
     const auto& config = channel->getEffectConfig();
     ensureChannelState(channel->getId());
 
-    std::string effect_name = config.effect;
-    // Look up effect in registry
+    const std::string& effect_name = config.effect;
+
+    auto to_upper = [](const std::string& value) {
+        std::string upper = value;
+        std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) {
+            return static_cast<char>(std::toupper(c));
+            });
+        return upper;
+        };
+
+    std::string normalized = to_upper(effect_name);
+
+    // Raw mode indicates the firmware is managing the pixel buffer directly.
+    if (normalized == "RAW") {
+        return;
+    }
+
+    // Look up effect in registry (case-insensitive).
     auto it = effect_registry_.find(effect_name);
+    if (it == effect_registry_.end()) {
+        it = effect_registry_.find(normalized);
+    }
+
     if (it != effect_registry_.end()) {
         it->second.fn(this, channel, tick);
     }
