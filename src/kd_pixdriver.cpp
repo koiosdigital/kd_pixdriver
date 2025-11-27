@@ -382,28 +382,22 @@ void PixelChannel::setEffect(const EffectConfig& effect_config) {
     if (!effect_config.mask.empty() && effect_config.mask.size() == config_.pixel_count) {
         setMask(effect_config.mask);
     }
-
-    saveToNVS();
 }
 
 void PixelChannel::setColor(const PixelColor& color) {
     effect_config_.color = color;
-    saveToNVS();
 }
 
 void PixelChannel::setBrightness(uint8_t brightness) {
     effect_config_.brightness = brightness;
-    saveToNVS();
 }
 
 void PixelChannel::setSpeed(uint8_t speed) {
     effect_config_.speed = std::clamp(speed, uint8_t(1), uint8_t(10));
-    saveToNVS();
 }
 
 void PixelChannel::setEnabled(bool enabled) {
     effect_config_.enabled = enabled;
-    saveToNVS();
 }
 
 void PixelChannel::setMask(const std::vector<uint8_t>& mask) {
