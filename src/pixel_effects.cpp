@@ -83,9 +83,8 @@ void PixelEffectEngine::applySolid(PixelChannel* channel) {
     const auto& config = channel->getEffectConfig();
     auto& buffer = channel->getPixelBuffer();
 
-    PixelColor scaled_color = config.color.scale(config.brightness);
-
-    std::fill(buffer.begin(), buffer.end(), scaled_color);
+    // Use unscaled color - brightness scaling happens later
+    std::fill(buffer.begin(), buffer.end(), config.color);
 }
 
 void PixelEffectEngine::applyBlink(PixelChannel* channel, uint32_t tick) {
@@ -101,7 +100,7 @@ void PixelEffectEngine::applyBlink(PixelChannel* channel, uint32_t tick) {
     }
 
     if (state.direction) {
-        PixelColor scaled_color = config.color.scale(config.brightness);
+        PixelColor scaled_color = config.color;
         std::fill(buffer.begin(), buffer.end(), scaled_color);
     }
     else {
@@ -119,8 +118,8 @@ void PixelEffectEngine::applyBreathe(PixelChannel* channel, uint32_t tick) {
     if (tick - state.last_update_tick >= interval) {
         if (state.breathe.increasing) {
             state.breathe.current_brightness += 5;
-            if (state.breathe.current_brightness >= config.brightness) {
-                state.breathe.current_brightness = config.brightness;
+            if (state.breathe.current_brightness >= 255) {
+                state.breathe.current_brightness = 255;
                 state.breathe.increasing = false;
             }
         }
@@ -134,8 +133,9 @@ void PixelEffectEngine::applyBreathe(PixelChannel* channel, uint32_t tick) {
         state.last_update_tick = tick;
     }
 
-    PixelColor scaled_color = config.color.scale(state.breathe.current_brightness);
-    std::fill(buffer.begin(), buffer.end(), scaled_color);
+    // Apply breathe animation (0-255) to the base color
+    PixelColor breathe_color = config.color.scale(state.breathe.current_brightness);
+    std::fill(buffer.begin(), buffer.end(), breathe_color);
 }
 
 void PixelEffectEngine::applyCyclic(PixelChannel* channel, uint32_t tick) {
@@ -155,7 +155,7 @@ void PixelEffectEngine::applyCyclic(PixelChannel* channel, uint32_t tick) {
 
     // Draw trail
     const int trail_length = std::min(5, static_cast<int>(buffer.size()));
-    PixelColor base_color = config.color.scale(config.brightness);
+    PixelColor base_color = config.color;
 
     for (int i = 0; i < trail_length; ++i) {
         int pixel_idx = (state.cyclic.trail_offset + i) % buffer.size();
@@ -212,7 +212,7 @@ void PixelEffectEngine::applyColorWipe(PixelChannel* channel, uint32_t tick) {
     }
 
     PixelColor fill_color = state.color_wipe.clearing ?
-        PixelColor(0, 0, 0, 0) : config.color.scale(config.brightness);
+        PixelColor(0, 0, 0, 0) : config.color;
 
     // Fill pixels up to current position
     for (size_t i = 0; i < state.color_wipe.current_pixel && i < buffer.size(); ++i) {
@@ -239,7 +239,7 @@ void PixelEffectEngine::applyTheaterChase(PixelChannel* channel, uint32_t tick) 
         state.last_update_tick = tick;
     }
 
-    PixelColor on_color = config.color.scale(config.brightness);
+    PixelColor on_color = config.color;
 
     for (size_t i = 0; i < buffer.size(); ++i) {
         buffer[i] = ((i + state.theater_chase.offset) % 3 == 0) ?
@@ -261,7 +261,7 @@ void PixelEffectEngine::applySparkle(PixelChannel* channel, uint32_t tick) {
         // Randomly light some pixels
         for (size_t i = 0; i < buffer.size(); ++i) {
             if ((esp_random() % 20) == 0) {  // 5% chance per pixel
-                buffer[i] = config.color.scale(config.brightness);
+                buffer[i] = config.color;
             }
         }
 

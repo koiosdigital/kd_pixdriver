@@ -581,19 +581,27 @@ uint32_t PixelChannel::getCurrentConsumption() const {
 }
 
 void PixelChannel::applyCurrentScaling(float scale_factor) {
-    if (scale_factor >= 1.0f) {
-        // No scaling needed
-        scaled_buffer_ = pixel_buffer_;
+    // First, copy pixel_buffer_ to scaled_buffer_ with brightness scaling applied
+    float brightness_scale = effect_config_.brightness / 255.0f;
+
+    for (size_t i = 0; i < pixel_buffer_.size(); ++i) {
+        const auto& original = pixel_buffer_[i];
+        scaled_buffer_[i] = PixelColor(
+            static_cast<uint8_t>(original.r * brightness_scale),
+            static_cast<uint8_t>(original.g * brightness_scale),
+            static_cast<uint8_t>(original.b * brightness_scale),
+            static_cast<uint8_t>(original.w * brightness_scale)
+        );
     }
-    else {
-        // Scale all pixels
-        for (size_t i = 0; i < pixel_buffer_.size(); ++i) {
-            const auto& original = pixel_buffer_[i];
-            scaled_buffer_[i] = PixelColor(
-                static_cast<uint8_t>(original.r * scale_factor),
-                static_cast<uint8_t>(original.g * scale_factor),
-                static_cast<uint8_t>(original.b * scale_factor),
-                static_cast<uint8_t>(original.w * scale_factor)
+
+    // Then, apply current limiting if needed
+    if (scale_factor < 1.0f) {
+        for (auto& pixel : scaled_buffer_) {
+            pixel = PixelColor(
+                static_cast<uint8_t>(pixel.r * scale_factor),
+                static_cast<uint8_t>(pixel.g * scale_factor),
+                static_cast<uint8_t>(pixel.b * scale_factor),
+                static_cast<uint8_t>(pixel.w * scale_factor)
             );
         }
     }
