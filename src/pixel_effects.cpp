@@ -3,42 +3,89 @@
 #include "esp_random.h"
 #include <algorithm>
 #include <cmath>
-#include <vector>
-#include <utility>
-#include <unordered_map>
-#include <functional>
 #include <cctype>
+
+namespace {
+constexpr const char* TAG = "pixel_effects";
+
+// Gamma correction table for more natural-looking brightness
+constexpr std::array<uint8_t, 256> GAMMA_TABLE = {
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
+    0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   1,   1,   1,   1,
+    1,   1,   1,   1,   1,   1,   1,   1,   1,   2,   2,   2,   2,   2,   2,   2,
+    2,   3,   3,   3,   3,   3,   3,   3,   4,   4,   4,   4,   4,   5,   5,   5,
+    5,   6,   6,   6,   6,   7,   7,   7,   7,   8,   8,   8,   9,   9,   9,  10,
+   10,  10,  11,  11,  11,  12,  12,  13,  13,  13,  14,  14,  15,  15,  16,  16,
+   17,  17,  18,  18,  19,  19,  20,  20,  21,  21,  22,  22,  23,  24,  24,  25,
+   25,  26,  27,  27,  28,  29,  29,  30,  31,  32,  32,  33,  34,  35,  35,  36,
+   37,  38,  39,  39,  40,  41,  42,  43,  44,  45,  46,  47,  48,  49,  50,  50,
+   51,  52,  54,  55,  56,  57,  58,  59,  60,  61,  62,  63,  64,  66,  67,  68,
+   69,  70,  72,  73,  74,  75,  77,  78,  79,  81,  82,  83,  85,  86,  87,  89,
+   90,  92,  93,  95,  96,  98,  99, 101, 102, 104, 105, 107, 109, 110, 112, 114,
+  115, 117, 119, 120, 122, 124, 126, 127, 129, 131, 133, 135, 137, 138, 140, 142,
+  144, 146, 148, 150, 152, 154, 156, 158, 160, 162, 164, 167, 169, 171, 173, 175,
+  177, 180, 182, 184, 186, 189, 191, 193, 196, 198, 200, 203, 205, 208, 210, 213,
+  215, 218, 220, 223, 225, 228, 231, 233, 236, 239, 241, 244, 247, 249, 252, 255
+};
+
+// Fast pseudo-random for effects (not cryptographic)
+inline uint32_t fastRandom() {
+    return esp_random();
+}
+
+inline uint8_t fastRandomByte() {
+    return static_cast<uint8_t>(esp_random() & 0xFF);
+}
+
+// Case-insensitive string comparison
+inline bool equalsIgnoreCase(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::toupper(static_cast<unsigned char>(a[i])) !=
+            std::toupper(static_cast<unsigned char>(b[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // anonymous namespace
+
+// Static member initialization
+const std::array<uint8_t, 256> PixelEffectEngine::sin_table_ = PixelEffectEngine::generateSinTable();
 
 PixelEffectEngine::PixelEffectEngine(uint32_t update_rate_hz)
     : update_rate_hz_(update_rate_hz) {
-    // Reserve space for a reasonable number of channels
-    channel_states_.reserve(8);
+    channel_states_.reserve(4);
 
     // Register all built-in effects
-    registerEffect("SOLID", "Solid", [](PixelEffectEngine* engine, PixelChannel* channel, uint32_t tick) {
-        engine->applySolid(channel);
+    auto reg = [this](std::string_view id, std::string_view name, auto fn) {
+        registerEffect(id, name, [fn](PixelEffectEngine* e, PixelChannel* c, uint32_t t) {
+            (e->*fn)(c, t);
         });
-    registerEffect("BLINK", "Blink", [](PixelEffectEngine* engine, PixelChannel* channel, uint32_t tick) {
-        engine->applyBlink(channel, tick);
-        });
-    registerEffect("BREATHE", "Breathe", [](PixelEffectEngine* engine, PixelChannel* channel, uint32_t tick) {
-        engine->applyBreathe(channel, tick);
-        });
-    registerEffect("CYCLIC", "Cyclic", [](PixelEffectEngine* engine, PixelChannel* channel, uint32_t tick) {
-        engine->applyCyclic(channel, tick);
-        });
-    registerEffect("RAINBOW", "Rainbow", [](PixelEffectEngine* engine, PixelChannel* channel, uint32_t tick) {
-        engine->applyRainbow(channel, tick);
-        });
-    registerEffect("COLOR_WIPE", "Color Wipe", [](PixelEffectEngine* engine, PixelChannel* channel, uint32_t tick) {
-        engine->applyColorWipe(channel, tick);
-        });
-    registerEffect("THEATER_CHASE", "Theater Chase", [](PixelEffectEngine* engine, PixelChannel* channel, uint32_t tick) {
-        engine->applyTheaterChase(channel, tick);
-        });
-    registerEffect("SPARKLE", "Sparkle", [](PixelEffectEngine* engine, PixelChannel* channel, uint32_t tick) {
-        engine->applySparkle(channel, tick);
-        });
+    };
+
+    // Original effects
+    registerEffect("SOLID", "Solid", [](PixelEffectEngine* e, PixelChannel* c, uint32_t) {
+        e->applySolid(c);
+    });
+    reg("BLINK", "Blink", &PixelEffectEngine::applyBlink);
+    reg("BREATHE", "Breathe", &PixelEffectEngine::applyBreathe);
+    reg("CYCLIC", "Cyclic", &PixelEffectEngine::applyCyclic);
+    reg("RAINBOW", "Rainbow", &PixelEffectEngine::applyRainbow);
+    reg("COLOR_WIPE", "Color Wipe", &PixelEffectEngine::applyColorWipe);
+    reg("THEATER_CHASE", "Theater Chase", &PixelEffectEngine::applyTheaterChase);
+    reg("SPARKLE", "Sparkle", &PixelEffectEngine::applySparkle);
+
+    // New effects
+    reg("COMET", "Comet", &PixelEffectEngine::applyComet);
+    reg("FIRE", "Fire", &PixelEffectEngine::applyFire);
+    reg("WAVE", "Wave", &PixelEffectEngine::applyWave);
+    reg("TWINKLE", "Twinkle", &PixelEffectEngine::applyTwinkle);
+    reg("GRADIENT", "Gradient", &PixelEffectEngine::applyGradient);
+    reg("PULSE", "Pulse", &PixelEffectEngine::applyPulse);
+    reg("METEOR", "Meteor", &PixelEffectEngine::applyMeteor);
+    reg("RUNNING_LIGHTS", "Running Lights", &PixelEffectEngine::applyRunningLights);
 }
 
 void PixelEffectEngine::updateEffect(PixelChannel* channel, uint32_t tick) {
@@ -49,41 +96,32 @@ void PixelEffectEngine::updateEffect(PixelChannel* channel, uint32_t tick) {
 
     const std::string& effect_name = config.effect;
 
-    auto to_upper = [](const std::string& value) {
-        std::string upper = value;
-        std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) {
-            return static_cast<char>(std::toupper(c));
-            });
-        return upper;
-        };
-
-    std::string normalized = to_upper(effect_name);
-
-    // Raw mode indicates the firmware is managing the pixel buffer directly.
-    if (normalized == "RAW") {
+    // Raw mode - firmware manages buffer directly
+    if (equalsIgnoreCase(effect_name, "RAW")) {
         return;
     }
 
-    // Look up effect in registry (case-insensitive).
-    auto it = effect_registry_.find(effect_name);
-    if (it == effect_registry_.end()) {
-        it = effect_registry_.find(normalized);
+    // Try exact match first (common case)
+    if (auto it = effect_registry_.find(effect_name); it != effect_registry_.end()) {
+        it->second.fn(this, channel, tick);
+        return;
     }
 
-    if (it != effect_registry_.end()) {
-        it->second.fn(this, channel, tick);
+    // Try case-insensitive search
+    for (const auto& [key, entry] : effect_registry_) {
+        if (equalsIgnoreCase(key, effect_name)) {
+            entry.fn(this, channel, tick);
+            return;
+        }
     }
-    else {
-        // Fallback to solid
-        applySolid(channel);
-    }
+
+    // Fallback to solid
+    applySolid(channel);
 }
 
 void PixelEffectEngine::applySolid(PixelChannel* channel) {
     const auto& config = channel->getEffectConfig();
     auto& buffer = channel->getPixelBuffer();
-
-    // Use unscaled color - brightness scaling happens later
     std::fill(buffer.begin(), buffer.end(), config.color);
 }
 
@@ -92,20 +130,15 @@ void PixelEffectEngine::applyBlink(PixelChannel* channel, uint32_t tick) {
     auto& buffer = channel->getPixelBuffer();
     auto& state = channel_states_[channel->getId()];
 
-    uint32_t interval = getEffectInterval(config.speed);
+    const uint32_t interval = getEffectInterval(config.speed);
 
     if (tick - state.last_update_tick >= interval) {
-        state.direction = !state.direction;  // Toggle blink state
+        state.direction = !state.direction;
         state.last_update_tick = tick;
     }
 
-    if (state.direction) {
-        PixelColor scaled_color = config.color;
-        std::fill(buffer.begin(), buffer.end(), scaled_color);
-    }
-    else {
-        std::fill(buffer.begin(), buffer.end(), PixelColor(0, 0, 0, 0));
-    }
+    const PixelColor color = state.direction ? config.color : PixelColor::Black();
+    std::fill(buffer.begin(), buffer.end(), color);
 }
 
 void PixelEffectEngine::applyBreathe(PixelChannel* channel, uint32_t tick) {
@@ -113,29 +146,30 @@ void PixelEffectEngine::applyBreathe(PixelChannel* channel, uint32_t tick) {
     auto& buffer = channel->getPixelBuffer();
     auto& state = channel_states_[channel->getId()];
 
-    uint32_t interval = getEffectInterval(config.speed) / 4;  // Smoother breathing
+    const uint32_t interval = getEffectInterval(config.speed) / 4;
 
     if (tick - state.last_update_tick >= interval) {
         if (state.breathe.increasing) {
-            state.breathe.current_brightness += 5;
-            if (state.breathe.current_brightness >= 255) {
-                state.breathe.current_brightness = 255;
+            state.breathe.brightness += 5;
+            if (state.breathe.brightness >= 250) {
+                state.breathe.brightness = 255;
                 state.breathe.increasing = false;
             }
-        }
-        else {
-            state.breathe.current_brightness -= 5;
-            if (state.breathe.current_brightness <= 0) {
-                state.breathe.current_brightness = 0;
+        } else {
+            if (state.breathe.brightness <= 5) {
+                state.breathe.brightness = 0;
                 state.breathe.increasing = true;
+            } else {
+                state.breathe.brightness -= 5;
             }
         }
         state.last_update_tick = tick;
     }
 
-    // Apply breathe animation (0-255) to the base color
-    PixelColor breathe_color = config.color.scale(state.breathe.current_brightness);
-    std::fill(buffer.begin(), buffer.end(), breathe_color);
+    // Use gamma correction for smoother breathing
+    const uint8_t gamma_brightness = gammaCorrect(state.breathe.brightness);
+    const PixelColor color = config.color.scale(gamma_brightness);
+    std::fill(buffer.begin(), buffer.end(), color);
 }
 
 void PixelEffectEngine::applyCyclic(PixelChannel* channel, uint32_t tick) {
@@ -143,24 +177,21 @@ void PixelEffectEngine::applyCyclic(PixelChannel* channel, uint32_t tick) {
     auto& buffer = channel->getPixelBuffer();
     auto& state = channel_states_[channel->getId()];
 
-    uint32_t interval = getEffectInterval(config.speed);
+    const uint32_t interval = getEffectInterval(config.speed);
+    const size_t size = buffer.size();
 
     if (tick - state.last_update_tick >= interval) {
-        state.cyclic.trail_offset = (state.cyclic.trail_offset + 1) % buffer.size();
+        state.cyclic.offset = (state.cyclic.offset + 1) % size;
         state.last_update_tick = tick;
     }
 
-    // Clear buffer
-    std::fill(buffer.begin(), buffer.end(), PixelColor(0, 0, 0, 0));
+    std::fill(buffer.begin(), buffer.end(), PixelColor::Black());
 
-    // Draw trail
-    const int trail_length = std::min(5, static_cast<int>(buffer.size()));
-    PixelColor base_color = config.color;
-
+    const int trail_length = std::min(5, static_cast<int>(size));
     for (int i = 0; i < trail_length; ++i) {
-        int pixel_idx = (state.cyclic.trail_offset + i) % buffer.size();
-        uint8_t fade = 255 - (i * 255 / trail_length);
-        buffer[pixel_idx] = base_color.scale(fade);
+        const size_t idx = (state.cyclic.offset + i) % size;
+        const uint8_t fade = static_cast<uint8_t>(255 - (i * 255 / trail_length));
+        buffer[idx] = config.color.scale(fade);
     }
 }
 
@@ -169,15 +200,16 @@ void PixelEffectEngine::applyRainbow(PixelChannel* channel, uint32_t tick) {
     auto& buffer = channel->getPixelBuffer();
     auto& state = channel_states_[channel->getId()];
 
-    uint32_t interval = getEffectInterval(config.speed);
+    const uint32_t interval = getEffectInterval(config.speed);
+    const size_t size = buffer.size();
 
     if (tick - state.last_update_tick >= interval) {
-        state.rainbow.rainbow_offset = (state.rainbow.rainbow_offset + 1) % 256;
+        state.rainbow.offset = (state.rainbow.offset + 1) % 256;
         state.last_update_tick = tick;
     }
 
-    for (size_t i = 0; i < buffer.size(); ++i) {
-        uint8_t hue = static_cast<uint8_t>((i * 256 / buffer.size()) + state.rainbow.rainbow_offset) % 256;
+    for (size_t i = 0; i < size; ++i) {
+        const uint8_t hue = static_cast<uint8_t>((i * 256 / size) + state.rainbow.offset);
         buffer[i] = PixelColor::fromHSV(hue, 255, config.brightness);
     }
 }
@@ -187,43 +219,24 @@ void PixelEffectEngine::applyColorWipe(PixelChannel* channel, uint32_t tick) {
     auto& buffer = channel->getPixelBuffer();
     auto& state = channel_states_[channel->getId()];
 
-    uint32_t interval = getEffectInterval(config.speed);
+    const uint32_t interval = getEffectInterval(config.speed);
+    const size_t size = buffer.size();
 
     if (tick - state.last_update_tick >= interval) {
-        if (!state.color_wipe.clearing) {
-            if (state.color_wipe.current_pixel < buffer.size()) {
-                state.color_wipe.current_pixel++;
-            }
-            else {
-                state.color_wipe.clearing = true;
-                state.color_wipe.current_pixel = 0;
-            }
-        }
-        else {
-            if (state.color_wipe.current_pixel < buffer.size()) {
-                state.color_wipe.current_pixel++;
-            }
-            else {
-                state.color_wipe.clearing = false;
-                state.color_wipe.current_pixel = 0;
-            }
+        if (state.wipe.pixel < size) {
+            state.wipe.pixel++;
+        } else {
+            state.wipe.clearing = !state.wipe.clearing;
+            state.wipe.pixel = 0;
         }
         state.last_update_tick = tick;
     }
 
-    PixelColor fill_color = state.color_wipe.clearing ?
-        PixelColor(0, 0, 0, 0) : config.color;
+    const PixelColor fill = state.wipe.clearing ? PixelColor::Black() : config.color;
+    const PixelColor rest = state.wipe.clearing ? config.color : PixelColor::Black();
 
-    // Fill pixels up to current position
-    for (size_t i = 0; i < state.color_wipe.current_pixel && i < buffer.size(); ++i) {
-        buffer[i] = fill_color;
-    }
-
-    // Clear remaining pixels if not clearing phase
-    if (!state.color_wipe.clearing) {
-        for (size_t i = state.color_wipe.current_pixel; i < buffer.size(); ++i) {
-            buffer[i] = PixelColor(0, 0, 0, 0);
-        }
+    for (size_t i = 0; i < size; ++i) {
+        buffer[i] = (i < state.wipe.pixel) ? fill : rest;
     }
 }
 
@@ -232,18 +245,15 @@ void PixelEffectEngine::applyTheaterChase(PixelChannel* channel, uint32_t tick) 
     auto& buffer = channel->getPixelBuffer();
     auto& state = channel_states_[channel->getId()];
 
-    uint32_t interval = getEffectInterval(config.speed);
+    const uint32_t interval = getEffectInterval(config.speed);
 
     if (tick - state.last_update_tick >= interval) {
-        state.theater_chase.offset = (state.theater_chase.offset + 1) % 3;
+        state.chase.offset = (state.chase.offset + 1) % 3;
         state.last_update_tick = tick;
     }
 
-    PixelColor on_color = config.color;
-
     for (size_t i = 0; i < buffer.size(); ++i) {
-        buffer[i] = ((i + state.theater_chase.offset) % 3 == 0) ?
-            on_color : PixelColor(0, 0, 0, 0);
+        buffer[i] = ((i + state.chase.offset) % 3 == 0) ? config.color : PixelColor::Black();
     }
 }
 
@@ -252,16 +262,241 @@ void PixelEffectEngine::applySparkle(PixelChannel* channel, uint32_t tick) {
     auto& buffer = channel->getPixelBuffer();
     auto& state = channel_states_[channel->getId()];
 
-    uint32_t interval = getEffectInterval(config.speed) / 2;  // Faster sparkle
+    const uint32_t interval = getEffectInterval(config.speed) / 2;
 
     if (tick - state.last_update_tick >= interval) {
-        // Clear all pixels first
-        std::fill(buffer.begin(), buffer.end(), PixelColor(0, 0, 0, 0));
+        std::fill(buffer.begin(), buffer.end(), PixelColor::Black());
 
-        // Randomly light some pixels
+        // Light random pixels (about 5% chance each)
         for (size_t i = 0; i < buffer.size(); ++i) {
-            if ((esp_random() % 20) == 0) {  // 5% chance per pixel
+            if ((fastRandom() % 20) == 0) {
                 buffer[i] = config.color;
+            }
+        }
+        state.last_update_tick = tick;
+    }
+}
+
+// ============= NEW EFFECTS =============
+
+void PixelEffectEngine::applyComet(PixelChannel* channel, uint32_t tick) {
+    const auto& config = channel->getEffectConfig();
+    auto& buffer = channel->getPixelBuffer();
+    auto& state = channel_states_[channel->getId()];
+
+    const uint32_t interval = getEffectInterval(config.speed);
+    const int size = static_cast<int>(buffer.size());
+    const int tail_length = std::max(3, size / 4);
+
+    if (tick - state.last_update_tick >= interval) {
+        state.comet.head++;
+        if (state.comet.head >= size + tail_length) {
+            state.comet.head = -tail_length;
+        }
+        state.last_update_tick = tick;
+    }
+
+    // Fade existing pixels
+    for (auto& pixel : buffer) {
+        pixel = pixel.scale(200);  // Fade by ~20%
+    }
+
+    // Draw comet head and tail
+    for (int i = 0; i < tail_length; ++i) {
+        const int pos = state.comet.head - i;
+        if (pos >= 0 && pos < size) {
+            const uint8_t brightness = static_cast<uint8_t>(255 - (i * 255 / tail_length));
+            buffer[pos] = config.color.scale(brightness);
+        }
+    }
+}
+
+void PixelEffectEngine::applyFire(PixelChannel* channel, uint32_t tick) {
+    const auto& config = channel->getEffectConfig();
+    auto& buffer = channel->getPixelBuffer();
+    auto& state = channel_states_[channel->getId()];
+
+    const uint32_t interval = getEffectInterval(config.speed) / 2;
+    const size_t size = buffer.size();
+
+    if (tick - state.last_update_tick >= interval) {
+        // Cool down every cell
+        for (size_t i = 0; i < std::min(size, size_t(64)); ++i) {
+            const uint8_t cooldown = fastRandomByte() % ((55 * 10 / size) + 2);
+            state.fire.heat[i] = (state.fire.heat[i] > cooldown) ?
+                state.fire.heat[i] - cooldown : 0;
+        }
+
+        // Heat rises - diffuse upward
+        for (size_t i = std::min(size, size_t(64)) - 1; i >= 2; --i) {
+            state.fire.heat[i] = (state.fire.heat[i - 1] +
+                                  state.fire.heat[i - 2] +
+                                  state.fire.heat[i - 2]) / 3;
+        }
+
+        // Randomly ignite new sparks at bottom
+        if (fastRandomByte() < 120) {
+            const int pos = fastRandomByte() % std::min(7, static_cast<int>(size));
+            state.fire.heat[pos] = std::min(255,
+                state.fire.heat[pos] + 160 + (fastRandomByte() % 96));
+        }
+
+        state.last_update_tick = tick;
+    }
+
+    // Map heat to color
+    for (size_t i = 0; i < size; ++i) {
+        const uint8_t heat = (i < 64) ? state.fire.heat[i] : 0;
+        // Heat color: black -> red -> orange -> yellow -> white
+        uint8_t r, g, b;
+        if (heat < 85) {
+            r = heat * 3;
+            g = 0;
+            b = 0;
+        } else if (heat < 170) {
+            r = 255;
+            g = (heat - 85) * 3;
+            b = 0;
+        } else {
+            r = 255;
+            g = 255;
+            b = (heat - 170) * 3;
+        }
+        buffer[i] = PixelColor(r, g, b).scale(config.brightness);
+    }
+}
+
+void PixelEffectEngine::applyWave(PixelChannel* channel, uint32_t tick) {
+    const auto& config = channel->getEffectConfig();
+    auto& buffer = channel->getPixelBuffer();
+    auto& state = channel_states_[channel->getId()];
+
+    const uint32_t interval = getEffectInterval(config.speed) / 4;
+    const size_t size = buffer.size();
+
+    if (tick - state.last_update_tick >= interval) {
+        state.wave.position++;
+        state.last_update_tick = tick;
+    }
+
+    for (size_t i = 0; i < size; ++i) {
+        // Create smooth sine wave
+        const uint8_t phase = static_cast<uint8_t>(
+            (i * 256 / size) + state.wave.position
+        );
+        const uint8_t brightness = sin_table_[phase];
+        buffer[i] = config.color.scale(brightness);
+    }
+}
+
+void PixelEffectEngine::applyTwinkle(PixelChannel* channel, uint32_t tick) {
+    const auto& config = channel->getEffectConfig();
+    auto& buffer = channel->getPixelBuffer();
+    auto& state = channel_states_[channel->getId()];
+
+    const uint32_t interval = getEffectInterval(config.speed) / 4;
+
+    if (tick - state.last_update_tick >= interval) {
+        // Fade all pixels slightly
+        for (auto& pixel : buffer) {
+            pixel = pixel.scale(245);
+        }
+
+        // Randomly brighten some pixels
+        for (size_t i = 0; i < buffer.size(); ++i) {
+            if ((fastRandom() % 50) == 0) {
+                buffer[i] = config.color;
+            }
+        }
+        state.last_update_tick = tick;
+    }
+}
+
+void PixelEffectEngine::applyGradient(PixelChannel* channel, uint32_t tick) {
+    const auto& config = channel->getEffectConfig();
+    auto& buffer = channel->getPixelBuffer();
+    auto& state = channel_states_[channel->getId()];
+
+    const uint32_t interval = getEffectInterval(config.speed);
+    const size_t size = buffer.size();
+
+    if (tick - state.last_update_tick >= interval) {
+        state.phase++;
+        state.last_update_tick = tick;
+    }
+
+    // Create gradient from color to complementary color
+    const PixelColor complement(
+        static_cast<uint8_t>(255 - config.color.r),
+        static_cast<uint8_t>(255 - config.color.g),
+        static_cast<uint8_t>(255 - config.color.b)
+    );
+
+    for (size_t i = 0; i < size; ++i) {
+        const uint8_t pos = static_cast<uint8_t>((i * 256 / size) + state.phase);
+        const uint8_t blend_amount = sin_table_[pos];
+        buffer[i] = config.color.blend(complement, blend_amount);
+    }
+}
+
+void PixelEffectEngine::applyPulse(PixelChannel* channel, uint32_t tick) {
+    const auto& config = channel->getEffectConfig();
+    auto& buffer = channel->getPixelBuffer();
+    auto& state = channel_states_[channel->getId()];
+
+    const uint32_t interval = getEffectInterval(config.speed) / 8;
+    const size_t size = buffer.size();
+    const size_t center = size / 2;
+
+    if (tick - state.last_update_tick >= interval) {
+        state.phase++;
+        state.last_update_tick = tick;
+    }
+
+    std::fill(buffer.begin(), buffer.end(), PixelColor::Black());
+
+    // Create expanding pulse from center
+    const uint8_t pulse_width = static_cast<uint8_t>(state.phase % (size / 2 + 10));
+
+    for (size_t i = 0; i < size; ++i) {
+        const int dist = std::abs(static_cast<int>(i) - static_cast<int>(center));
+        if (dist <= pulse_width) {
+            const uint8_t brightness = static_cast<uint8_t>(
+                255 - (dist * 255 / (pulse_width + 1))
+            );
+            buffer[i] = config.color.scale(brightness);
+        }
+    }
+}
+
+void PixelEffectEngine::applyMeteor(PixelChannel* channel, uint32_t tick) {
+    const auto& config = channel->getEffectConfig();
+    auto& buffer = channel->getPixelBuffer();
+    auto& state = channel_states_[channel->getId()];
+
+    const uint32_t interval = getEffectInterval(config.speed);
+    const int size = static_cast<int>(buffer.size());
+    const int meteor_size = std::max(3, size / 8);
+
+    if (tick - state.last_update_tick >= interval) {
+        // Random decay of trail
+        for (auto& pixel : buffer) {
+            if (fastRandomByte() < 64) {
+                pixel = pixel.scale(192);
+            }
+        }
+
+        state.comet.head++;
+        if (state.comet.head >= size * 2) {
+            state.comet.head = 0;
+        }
+
+        // Draw meteor
+        for (int i = 0; i < meteor_size; ++i) {
+            const int pos = state.comet.head - i;
+            if (pos >= 0 && pos < size) {
+                const uint8_t brightness = static_cast<uint8_t>(255 - (i * 255 / meteor_size));
+                buffer[pos] = config.color.scale(brightness);
             }
         }
 
@@ -269,64 +504,57 @@ void PixelEffectEngine::applySparkle(PixelChannel* channel, uint32_t tick) {
     }
 }
 
-void PixelEffectEngine::applyCustom(PixelChannel* channel, uint32_t tick) {
+void PixelEffectEngine::applyRunningLights(PixelChannel* channel, uint32_t tick) {
     const auto& config = channel->getEffectConfig();
+    auto& buffer = channel->getPixelBuffer();
+    auto& state = channel_states_[channel->getId()];
 
-    if (config.custom_effect) {
-        auto& buffer = channel->getPixelBuffer();
-        config.custom_effect(buffer, tick);
+    const uint32_t interval = getEffectInterval(config.speed) / 4;
+    const size_t size = buffer.size();
+
+    if (tick - state.last_update_tick >= interval) {
+        state.phase++;
+        state.last_update_tick = tick;
     }
-    else {
-        // Fallback to solid if no custom effect is defined
-        applySolid(channel);
+
+    for (size_t i = 0; i < size; ++i) {
+        // Create running wave pattern
+        const uint8_t wave = sin_table_[(i * 32 + state.phase * 4) & 0xFF];
+        buffer[i] = config.color.scale(wave);
     }
 }
 
-uint32_t PixelEffectEngine::getEffectInterval(uint8_t speed) const {
-    // Convert speed (1-10) to update interval in ticks
-    // Higher speed = lower interval = faster updates
+// ============= HELPER FUNCTIONS =============
+
+uint32_t PixelEffectEngine::getEffectInterval(uint8_t speed) const noexcept {
     const uint32_t base_interval = update_rate_hz_ / 10;  // 100ms at 60Hz
-    return base_interval * (11 - std::clamp(speed, uint8_t(1), uint8_t(10)));
+    const uint8_t clamped_speed = std::clamp(speed, uint8_t(1), uint8_t(10));
+    return base_interval * (11 - clamped_speed);
 }
 
 void PixelEffectEngine::ensureChannelState(int32_t channel_id) {
     if (channel_id >= static_cast<int32_t>(channel_states_.size())) {
         channel_states_.resize(channel_id + 1);
-
-        // Initialize new state
-        auto& state = channel_states_[channel_id];
-        state.last_update_tick = 0;
-        state.phase = 0;
-        state.direction = false;
-
-        // Initialize effect-specific state
-        state.breathe.current_brightness = 0;
-        state.breathe.increasing = true;
-        state.color_wipe.current_pixel = 0;
-        state.color_wipe.clearing = false;
-        state.theater_chase.offset = 0;
-        state.rainbow.rainbow_offset = 0;
-        state.cyclic.trail_offset = 0;
     }
 }
 
-void PixelEffectEngine::registerEffect(const std::string& name, const std::string& display_name, EffectFn fn) {
-    effect_registry_[name] = EffectEntry{ fn, display_name };
+uint8_t PixelEffectEngine::gammaCorrect(uint8_t value) noexcept {
+    return GAMMA_TABLE[value];
 }
 
-void PixelEffectEngine::registerEffect(const std::string& name, EffectFn fn) {
-    // For backward compatibility, use name as display name
-    registerEffect(name, name, fn);
+void PixelEffectEngine::registerEffect(std::string_view name, std::string_view display_name, EffectFn fn) {
+    effect_registry_[std::string(name)] = EffectEntry{std::move(fn), std::string(display_name)};
+}
+
+void PixelEffectEngine::unregisterEffect(std::string_view name) {
+    effect_registry_.erase(std::string(name));
 }
 
 std::vector<PixelEffectEngine::EffectInfo> PixelEffectEngine::getAllEffects() const {
     std::vector<EffectInfo> effects;
+    effects.reserve(effect_registry_.size());
     for (const auto& [id, entry] : effect_registry_) {
-        effects.push_back({ id, entry.display_name });
+        effects.push_back({id, entry.display_name});
     }
     return effects;
-}
-
-void PixelEffectEngine::unregisterEffect(const std::string& name) {
-    effect_registry_.erase(name);
 }
