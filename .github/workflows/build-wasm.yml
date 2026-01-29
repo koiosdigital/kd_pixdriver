@@ -1,0 +1,44 @@
+name: Build WASM
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  release:
+    types: [created]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.51
+
+      - name: Build WASM
+        run: |
+          cd wasm
+          mkdir build && cd build
+          emcmake cmake ..
+          emmake make
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pixel-preview-wasm-${{ github.sha }}
+          path: |
+            wasm/build/pixel_preview.js
+            wasm/build/pixel_preview.wasm
+
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            wasm/build/pixel_preview.js
+            wasm/build/pixel_preview.wasm

@@ -39,29 +39,6 @@ extern "C" IRAM_ATTR bool i2s_tx_callback(i2s_chan_handle_t handle,
     return false;
 }
 
-// PixelColor implementation
-PixelColor PixelColor::fromHSV(uint8_t hue, uint8_t saturation, uint8_t value) noexcept {
-    if (saturation == 0) {
-        return PixelColor(value, value, value);
-    }
-
-    const uint8_t region = hue / 43;
-    const uint8_t remainder = (hue - (region * 43)) * 6;
-
-    const uint8_t p = (value * (255 - saturation)) >> 8;
-    const uint8_t q = (value * (255 - ((saturation * remainder) >> 8))) >> 8;
-    const uint8_t t = (value * (255 - ((saturation * (255 - remainder)) >> 8))) >> 8;
-
-    switch (region) {
-        case 0:  return PixelColor(value, t, p);
-        case 1:  return PixelColor(q, value, p);
-        case 2:  return PixelColor(p, value, t);
-        case 3:  return PixelColor(p, q, value);
-        case 4:  return PixelColor(t, p, value);
-        default: return PixelColor(value, p, q);
-    }
-}
-
 // ============= PixelDriver Implementation =============
 
 void PixelDriver::initialize(uint32_t update_rate_hz) {

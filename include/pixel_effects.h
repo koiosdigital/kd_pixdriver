@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kd_pixdriver.h"
+#include "pixel_core.h"
 #include <cstdint>
 #include <vector>
 #include <string>

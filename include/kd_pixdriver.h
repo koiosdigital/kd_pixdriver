@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "pixel_core.h"
 
 // Forward declarations
 class PixelChannel;
@@ -18,73 +19,6 @@ class PixelEffectEngine;
 
 // I2S callback function
 extern "C" bool i2s_tx_callback(i2s_chan_handle_t handle, i2s_event_data_t* event, void* user_ctx);
-
-enum class PixelFormat : uint8_t {
-    RGB = 3,
-    RGBW = 4
-};
-
-struct PixelColor {
-    uint8_t r = 0;
-    uint8_t g = 0;
-    uint8_t b = 0;
-    uint8_t w = 0;
-
-    constexpr PixelColor() = default;
-    constexpr PixelColor(uint8_t red, uint8_t green, uint8_t blue, uint8_t white = 0) noexcept
-        : r(red), g(green), b(blue), w(white) {}
-
-    // Create from 32-bit RGB/RGBW value
-    static constexpr PixelColor fromRGB(uint32_t rgb) noexcept {
-        return PixelColor(
-            static_cast<uint8_t>((rgb >> 16) & 0xFF),
-            static_cast<uint8_t>((rgb >> 8) & 0xFF),
-            static_cast<uint8_t>(rgb & 0xFF)
-        );
-    }
-
-    // HSV to RGB conversion
-    static PixelColor fromHSV(uint8_t hue, uint8_t saturation, uint8_t value) noexcept;
-
-    // Scale color by brightness (0-255)
-    [[nodiscard]] constexpr PixelColor scale(uint8_t brightness) const noexcept {
-        if (brightness == 255) return *this;
-        return PixelColor(
-            static_cast<uint8_t>((r * brightness) / 255),
-            static_cast<uint8_t>((g * brightness) / 255),
-            static_cast<uint8_t>((b * brightness) / 255),
-            static_cast<uint8_t>((w * brightness) / 255)
-        );
-    }
-
-    // Blend two colors
-    [[nodiscard]] constexpr PixelColor blend(const PixelColor& other, uint8_t amount) const noexcept {
-        const uint8_t inv = 255 - amount;
-        return PixelColor(
-            static_cast<uint8_t>((r * inv + other.r * amount) / 255),
-            static_cast<uint8_t>((g * inv + other.g * amount) / 255),
-            static_cast<uint8_t>((b * inv + other.b * amount) / 255),
-            static_cast<uint8_t>((w * inv + other.w * amount) / 255)
-        );
-    }
-
-    // Common colors
-    static constexpr PixelColor Black() noexcept { return PixelColor(0, 0, 0); }
-    static constexpr PixelColor White() noexcept { return PixelColor(255, 255, 255); }
-    static constexpr PixelColor Red() noexcept { return PixelColor(255, 0, 0); }
-    static constexpr PixelColor Green() noexcept { return PixelColor(0, 255, 0); }
-    static constexpr PixelColor Blue() noexcept { return PixelColor(0, 0, 255); }
-    static constexpr PixelColor Yellow() noexcept { return PixelColor(255, 255, 0); }
-    static constexpr PixelColor Cyan() noexcept { return PixelColor(0, 255, 255); }
-    static constexpr PixelColor Magenta() noexcept { return PixelColor(255, 0, 255); }
-
-    constexpr bool operator==(const PixelColor& other) const noexcept {
-        return r == other.r && g == other.g && b == other.b && w == other.w;
-    }
-    constexpr bool operator!=(const PixelColor& other) const noexcept {
-        return !(*this == other);
-    }
-};
 
 struct ChannelConfig {
     gpio_num_t pin;
