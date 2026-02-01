@@ -22,6 +22,19 @@ val getEffectListJS() {
     return arr;
 }
 
+// Wrappers for version functions to return std::string instead of const char*
+std::string getVersionString() {
+    return std::string(getPixelDriverVersion());
+}
+
+std::string getVersionFullString() {
+    return std::string(getPixelDriverVersionFull());
+}
+
+std::string getBuildTimeString() {
+    return std::string(getPixelDriverBuildTime());
+}
+
 EMSCRIPTEN_BINDINGS(pixel_preview) {
     class_<PixelPreview>("PixelPreview")
         .constructor<uint16_t, bool, uint32_t>()
@@ -39,7 +52,7 @@ EMSCRIPTEN_BINDINGS(pixel_preview) {
         .class_function("getEffectList", &getEffectListJS);
 
     // Version API
-    function("getVersion", &getPixelDriverVersion);
-    function("getVersionFull", &getPixelDriverVersionFull);
-    function("getBuildTime", &getPixelDriverBuildTime);
+    function("getVersion", &getVersionString);
+    function("getVersionFull", &getVersionFullString);
+    function("getBuildTime", &getBuildTimeString);
 }
