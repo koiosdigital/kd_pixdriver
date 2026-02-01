@@ -21,13 +21,6 @@ if(NOT GIT_COMMIT_SHORT)
     set(GIT_COMMIT_FULL "unknown")
 endif()
 
-# Generate version header
-configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/pixel_version.h.in
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/pixel_version.h
-    @ONLY
-)
-
 idf_component_register(
     SRCS "src/kd_pixdriver.cpp"
          "src/pixel_effects.cpp"
@@ -35,4 +28,11 @@ idf_component_register(
     INCLUDE_DIRS "include"
     PRIV_REQUIRES "nvs_flash" "esp_system"
     REQUIRES "esp_driver_i2s" "esp_driver_gpio"
+)
+
+# Generate version header (must be after idf_component_register)
+configure_file(
+    ${COMPONENT_DIR}/include/pixel_version.h.in
+    ${COMPONENT_DIR}/include/pixel_version.h
+    @ONLY
 )
