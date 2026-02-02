@@ -8,6 +8,7 @@
 #include <string_view>
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
+#include "esp_http_server.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -83,6 +84,9 @@ public:
     [[nodiscard]] static uint32_t getTotalCurrentConsumption();
     [[nodiscard]] static uint32_t getScaledCurrentConsumption();
     [[nodiscard]] static float getCurrentScaleFactor();
+
+    // HTTP API
+    static void attach_api(httpd_handle_t server);
 
 private:
     PixelDriver() = delete;
