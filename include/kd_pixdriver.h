@@ -86,7 +86,11 @@ public:
     [[nodiscard]] static float getCurrentScaleFactor();
 
     // HTTP API
-    static void attach_api(httpd_handle_t server);
+    // register_fn lets the app route registration through a wrapper (e.g.
+    // kd_common_api_register_uri_handler for CORS); defaults to the bare
+    // httpd_register_uri_handler.
+    using uri_register_fn = esp_err_t (*)(httpd_handle_t, const httpd_uri_t*);
+    static void attach_api(httpd_handle_t server, uri_register_fn register_fn = nullptr);
 
 private:
     PixelDriver() = delete;

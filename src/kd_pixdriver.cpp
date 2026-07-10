@@ -807,14 +807,16 @@ esp_err_t led_channel_config_handler(httpd_req_t* req) {
 
 } // anonymous namespace
 
-void PixelDriver::attach_api(httpd_handle_t server) {
+void PixelDriver::attach_api(httpd_handle_t server, uri_register_fn register_fn) {
+    if (!register_fn) register_fn = httpd_register_uri_handler;
+
     static httpd_uri_t effects_uri = {
         .uri = "/api/led/effects",
         .method = HTTP_GET,
         .handler = led_effects_list_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(server, &effects_uri);
+    register_fn(server, &effects_uri);
 
     static httpd_uri_t config_uri = {
         .uri = "/api/led/config",
@@ -822,7 +824,7 @@ void PixelDriver::attach_api(httpd_handle_t server) {
         .handler = led_config_get_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(server, &config_uri);
+    register_fn(server, &config_uri);
 
     static httpd_uri_t channel_get_uri = {
         .uri = "/api/led/channel/*",
@@ -830,7 +832,7 @@ void PixelDriver::attach_api(httpd_handle_t server) {
         .handler = led_channel_get_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(server, &channel_get_uri);
+    register_fn(server, &channel_get_uri);
 
     static httpd_uri_t channel_post_uri = {
         .uri = "/api/led/channel/*",
@@ -838,7 +840,7 @@ void PixelDriver::attach_api(httpd_handle_t server) {
         .handler = led_channel_config_handler,
         .user_ctx = NULL
     };
-    httpd_register_uri_handler(server, &channel_post_uri);
+    register_fn(server, &channel_post_uri);
 
     ESP_LOGI(TAG, "LED API attached (version: %s)", PIXDRIVER_GIT_COMMIT);
 }
