@@ -157,7 +157,9 @@ void PixelDriver::start() {
     if (running_ || !initialized_) return;
 
     running_ = true;
-    xTaskCreate(driverTask, "pixdriver", 3072, nullptr, 7, &task_handle_);
+    // 4096: the task now runs saveToNVS (nvs_open/set_str/commit + several
+    // std::string key builds) from persistIfSettled; 3072 was borderline.
+    xTaskCreate(driverTask, "pixdriver", 4096, nullptr, 7, &task_handle_);
     ESP_LOGI(TAG, "PixelDriver started");
 }
 
