@@ -3,6 +3,7 @@
 #include "pixel_version.h"
 #include "i2s_pixel_protocol.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs.h"
 #include "cJSON.h"
 #include "driver/i2s_std.h"
@@ -245,6 +246,8 @@ void PixelDriver::driverTask(void* param) {
 
         for (auto& ch : channels_) {
             ch->transmit();
+            // Persist effect config changes once they settle (resume on boot)
+            ch->persistIfSettled();
         }
 
         tick++;
@@ -326,31 +329,57 @@ bool PixelChannel::initialize() {
     return true;
 }
 
+void PixelChannel::markConfigDirty() noexcept {
+    nvs_dirty_at_us_.store(esp_timer_get_time(), std::memory_order_relaxed);
+    nvs_dirty_.store(true, std::memory_order_release);
+}
+
+void PixelChannel::persistIfSettled() {
+    // Persist once the config has been stable for the settle window. Runs
+    // on the driver task; setters run on API/WS/schedule tasks, hence the
+    // atomics. saveToNVS() reads effect_config_ unlocked - a torn read of
+    // a mid-update config only persists a transiently stale value, which
+    // the next settle-save corrects.
+    constexpr int64_t kSettleUs = 2000000;  // 2s after the last change
+    if (!nvs_dirty_.load(std::memory_order_acquire)) return;
+    if (esp_timer_get_time() - nvs_dirty_at_us_.load(std::memory_order_relaxed) < kSettleUs) return;
+
+    nvs_dirty_.store(false, std::memory_order_release);
+    saveToNVS();
+    ESP_LOGD(TAG, "Persisted channel %ld effect config", id_);
+}
+
 void PixelChannel::setEffect(const EffectConfig& config) {
     effect_config_ = config;
     if (!config.mask.empty() && config.mask.size() == config_.pixel_count) {
         setMask(config.mask);
     }
+    markConfigDirty();
 }
 
 void PixelChannel::setEffectByID(std::string_view effect_id) {
     effect_config_.effect = std::string(effect_id);
+    markConfigDirty();
 }
 
 void PixelChannel::setColor(const PixelColor& color) noexcept {
     effect_config_.color = color;
+    markConfigDirty();
 }
 
 void PixelChannel::setBrightness(uint8_t brightness) noexcept {
     effect_config_.brightness = brightness;
+    markConfigDirty();
 }
 
 void PixelChannel::setSpeed(uint8_t speed) noexcept {
     effect_config_.speed = std::clamp(speed, uint8_t(1), uint8_t(10));
+    markConfigDirty();
 }
 
 void PixelChannel::setEnabled(bool enabled) noexcept {
     effect_config_.enabled = enabled;
+    markConfigDirty();
 }
 
 void PixelChannel::setMask(const std::vector<uint8_t>& mask) {
@@ -464,10 +493,22 @@ void PixelChannel::convertToI2SBuffer(const std::vector<PixelColor>& pixels) {
         const bool masked = effect_config_.mask.empty() ||
             (i < effect_config_.mask.size() && effect_config_.mask[i]);
 
-        const uint8_t g = masked ? pixel.g : 0;
-        const uint8_t r = masked ? pixel.r : 0;
-        const uint8_t b = masked ? pixel.b : 0;
-        const uint8_t w = masked ? pixel.w : 0;
+        uint8_t g = masked ? pixel.g : 0;
+        uint8_t r = masked ? pixel.r : 0;
+        uint8_t b = masked ? pixel.b : 0;
+        uint8_t w = masked ? pixel.w : 0;
+
+        // White extraction for RGBW strips: colors sourced from RGB (solid
+        // colors, effects) leave w == 0, which wastes the dedicated white
+        // die and renders whites as R+G+B glare. Move the common component
+        // to the white channel; a pixel that explicitly sets w keeps full
+        // manual control (no extraction).
+        if (config_.format == PixelFormat::RGBW && w == 0) {
+            w = std::min(r, std::min(g, b));
+            r = static_cast<uint8_t>(r - w);
+            g = static_cast<uint8_t>(g - w);
+            b = static_cast<uint8_t>(b - w);
+        }
 
         // GRB order for WS2812
         const uint8_t* g_seq = ws2812b_color_lookup[g];
@@ -722,21 +763,20 @@ esp_err_t led_channel_get_handler(httpd_req_t* req) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Channel not found");
         return ESP_FAIL;
     }
-    const ChannelConfig& cfg = ch->getConfig();
     const EffectConfig& eff = ch->getEffectConfig();
     cJSON* ch_obj = cJSON_CreateObject();
     cJSON_AddStringToObject(ch_obj, "effect_id", eff.effect.c_str());
     cJSON_AddNumberToObject(ch_obj, "brightness", eff.brightness);
     cJSON_AddNumberToObject(ch_obj, "speed", eff.speed);
     cJSON_AddBoolToObject(ch_obj, "on", eff.enabled);
-    cJSON* color_obj = cJSON_CreateObject();
-    cJSON_AddNumberToObject(color_obj, "r", eff.color.r);
-    cJSON_AddNumberToObject(color_obj, "g", eff.color.g);
-    cJSON_AddNumberToObject(color_obj, "b", eff.color.b);
-    if (cfg.format == PixelFormat::RGBW) {
-        cJSON_AddNumberToObject(color_obj, "w", eff.color.w);
-    }
-    cJSON_AddItemToObject(ch_obj, "color", color_obj);
+    // Hex string per the documented LEDChannelState schema. The old {r,g,b}
+    // object matched neither the docs nor the apps (which rendered it as a
+    // black swatch). The white channel is an internal detail (auto-derived
+    // by white extraction), so 6-digit RGB is the full public state.
+    char color_hex[8];
+    snprintf(color_hex, sizeof(color_hex), "#%02x%02x%02x",
+             eff.color.r, eff.color.g, eff.color.b);
+    cJSON_AddStringToObject(ch_obj, "color", color_hex);
     char* json = cJSON_Print(ch_obj);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, strlen(json));
@@ -788,7 +828,26 @@ esp_err_t led_channel_config_handler(httpd_req_t* req) {
     if (brightness && cJSON_IsNumber(brightness)) eff_cfg.brightness = brightness->valueint;
     if (speed && cJSON_IsNumber(speed)) eff_cfg.speed = speed->valueint;
     if (on && cJSON_IsBool(on)) eff_cfg.enabled = cJSON_IsTrue(on);
-    if (color && cJSON_IsObject(color)) {
+    if (color && cJSON_IsString(color)) {
+        // Documented form: "#rrggbb" (optionally "#rrggbbww"). This is what
+        // the apps send; it used to be silently ignored because only the
+        // legacy object form was parsed.
+        const char* s = color->valuestring;
+        if (*s == '#') s++;
+        unsigned r = 0, g = 0, b = 0, w = 0;
+        const size_t len = strlen(s);
+        if (len == 6 && sscanf(s, "%02x%02x%02x", &r, &g, &b) == 3) {
+            eff_cfg.color = PixelColor(static_cast<uint8_t>(r),
+                static_cast<uint8_t>(g), static_cast<uint8_t>(b));
+        }
+        else if (len == 8 && sscanf(s, "%02x%02x%02x%02x", &r, &g, &b, &w) == 4) {
+            eff_cfg.color = PixelColor(static_cast<uint8_t>(r),
+                static_cast<uint8_t>(g), static_cast<uint8_t>(b),
+                static_cast<uint8_t>(w));
+        }
+    }
+    else if (color && cJSON_IsObject(color)) {
+        // Legacy object form {r,g,b,w} - kept for older API consumers
         cJSON* r = cJSON_GetObjectItem(color, "r");
         cJSON* g = cJSON_GetObjectItem(color, "g");
         cJSON* b = cJSON_GetObjectItem(color, "b");

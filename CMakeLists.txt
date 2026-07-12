@@ -26,7 +26,7 @@ idf_component_register(
          "src/pixel_effects.cpp"
          "src/i2s_pixel_protocol.cpp"
     INCLUDE_DIRS "include"
-    PRIV_REQUIRES "nvs_flash" "esp_system" "cjson"
+    PRIV_REQUIRES "nvs_flash" "esp_system" "cjson" "esp_timer"
     REQUIRES "esp_driver_i2s" "esp_driver_gpio" "esp_http_server"
 )
 

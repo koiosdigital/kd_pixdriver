@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -155,7 +156,15 @@ public:
     void saveToNVS() const;
     void loadFromNVS();
 
+    /// Persist the effect config once it has stopped changing (called from
+    /// the driver task each tick). Debounced so slider drags / rapid API
+    /// calls become one NVS write instead of one per intermediate value.
+    void persistIfSettled();
+
 private:
+    /// Mark the effect config as needing persistence (any setter/API write)
+    void markConfigDirty() noexcept;
+
     void setupI2S();
     void cleanup();
     void convertToI2SBuffer(const std::vector<PixelColor>& pixels);
@@ -177,4 +186,9 @@ private:
     bool initialized_ = false;
     bool terminate_task_ = false;
     size_t bytes_sent_ = 0;
+
+    // Deferred NVS persistence: setters (API/WS/schedule tasks) mark dirty,
+    // the driver task saves after the config has been stable for a while.
+    std::atomic<bool> nvs_dirty_{ false };
+    std::atomic<int64_t> nvs_dirty_at_us_{ 0 };
 };
