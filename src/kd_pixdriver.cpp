@@ -157,9 +157,7 @@ void PixelDriver::start() {
     if (running_ || !initialized_) return;
 
     running_ = true;
-    // 4096: the task now runs saveToNVS (nvs_open/set_str/commit + several
-    // std::string key builds) from persistIfSettled; 3072 was borderline.
-    xTaskCreate(driverTask, "pixdriver", 8192, nullptr, 7, &task_handle_);
+    xTaskCreate(driverTask, "pixdriver", 4096, nullptr, 7, &task_handle_);
     ESP_LOGI(TAG, "PixelDriver started");
 }
 
@@ -320,7 +318,7 @@ bool PixelChannel::initialize() {
     char task_name[16];
     snprintf(task_name, sizeof(task_name), "i2s_%ld", id_);
 
-    if (xTaskCreate(i2sTaskWrapper, task_name, 3072, this,
+    if (xTaskCreate(i2sTaskWrapper, task_name, 1024, this,
         configMAX_PRIORITIES - 1, &i2s_task_handle_) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create I2S task for channel %ld", id_);
         cleanup();
