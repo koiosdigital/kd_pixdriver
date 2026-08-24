@@ -318,7 +318,10 @@ bool PixelChannel::initialize() {
     char task_name[16];
     snprintf(task_name, sizeof(task_name), "i2s_%ld", id_);
 
-    if (xTaskCreate(i2sTaskWrapper, task_name, 1024, this,
+    // 2048 (not 1024): this task enters the I2S driver (channel_write/enable)
+    // and formats ESP_LOGE(esp_err_to_name(...)) on error paths, at the highest
+    // priority where a stack overflow is a hard crash.
+    if (xTaskCreate(i2sTaskWrapper, task_name, 2048, this,
         configMAX_PRIORITIES - 1, &i2s_task_handle_) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create I2S task for channel %ld", id_);
         cleanup();
