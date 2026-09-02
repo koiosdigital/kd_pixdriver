@@ -278,8 +278,10 @@ PixelChannel::PixelChannel(int32_t id, const ChannelConfig& config)
     pixel_buffer_.resize(config.pixel_count, PixelColor::Black());
     scaled_buffer_.resize(config.pixel_count, PixelColor::Black());
 
-    const size_t bytes_per_pixel = (config.format == PixelFormat::RGBW)
-        ? WS2812B_BYTES_PER_RGBW : WS2812B_BYTES_PER_RGB;
+    // Encoded I2S bytes/pixel = 3 encoded bytes per WIRE channel. RGBCCT
+    // (FW1906) pixels occupy 6 wire channels - two RGB groups per chip
+    // frame - even though only 5 carry color; see wireChannelCount().
+    const size_t bytes_per_pixel = WS2812B_BYTES_PER_COLOR * wireChannelCount(config.format);
     const size_t buffer_size = (config.pixel_count * bytes_per_pixel) + WS2812B_RESET_BYTES;
     i2s_buffer_.resize(buffer_size, 0);
 
@@ -482,8 +484,10 @@ void PixelChannel::cleanup() {
 }
 
 void PixelChannel::convertToI2SBuffer(const std::vector<PixelColor>& pixels) {
-    const size_t bytes_per_pixel = (config_.format == PixelFormat::RGBW)
-        ? WS2812B_BYTES_PER_RGBW : WS2812B_BYTES_PER_RGB;
+    // WIRE channels: 3 (RGB) / 4 (RGBW) / 6 (RGBCCT on FW1906 - two RGB
+    // groups per chip frame, 6th output unused).
+    const size_t channels = wireChannelCount(config_.format);
+    const size_t bytes_per_pixel = WS2812B_BYTES_PER_COLOR * channels;
     const size_t data_size = pixels.size() * bytes_per_pixel;
 
     // Clear reset bytes
@@ -497,16 +501,19 @@ void PixelChannel::convertToI2SBuffer(const std::vector<PixelColor>& pixels) {
         const bool masked = effect_config_.mask.empty() ||
             (i < effect_config_.mask.size() && effect_config_.mask[i]);
 
-        uint8_t g = masked ? pixel.g : 0;
         uint8_t r = masked ? pixel.r : 0;
+        uint8_t g = masked ? pixel.g : 0;
         uint8_t b = masked ? pixel.b : 0;
         uint8_t w = masked ? pixel.w : 0;
+        uint8_t cw = masked ? pixel.cw : 0;
 
-        // White extraction for RGBW strips: colors sourced from RGB (solid
-        // colors, effects) leave w == 0, which wastes the dedicated white
-        // die and renders whites as R+G+B glare. Move the common component
-        // to the white channel; a pixel that explicitly sets w keeps full
-        // manual control (no extraction).
+        // White extraction for single-white (RGBW) strips: colors sourced from
+        // RGB (solid colors, effects) leave w == 0, which wastes the dedicated
+        // white die and renders whites as R+G+B glare. Move the common
+        // component to the white channel; a pixel that explicitly sets w keeps
+        // manual control. RGBCCT (dual white) is driven per-pixel end-to-end
+        // (w = warm, cw = cool) with no auto-extraction, so effects/API have
+        // full control of both white dies.
         if (config_.format == PixelFormat::RGBW && w == 0) {
             w = std::min(r, std::min(g, b));
             r = static_cast<uint8_t>(r - w);
@@ -514,21 +521,34 @@ void PixelChannel::convertToI2SBuffer(const std::vector<PixelColor>& pixels) {
             b = static_cast<uint8_t>(b - w);
         }
 
-        // GRB order for WS2812
-        const uint8_t* g_seq = ws2812b_color_lookup[g];
-        const uint8_t* r_seq = ws2812b_color_lookup[r];
-        const uint8_t* b_seq = ws2812b_color_lookup[b];
-
-        for (int j = 0; j < WS2812B_BYTES_PER_COLOR; ++j) {
-            i2s_buffer_[(base_idx + j) ^ 1] = g_seq[j];
-            i2s_buffer_[(base_idx + WS2812B_BYTES_PER_COLOR + j) ^ 1] = r_seq[j];
-            i2s_buffer_[(base_idx + 2 * WS2812B_BYTES_PER_COLOR + j) ^ 1] = b_seq[j];
+        // Assemble the per-pixel byte values in wire order: the R/G/B triple
+        // per color_order, then the white channel(s). For RGBCCT (FW1906) the
+        // frame is two RGB groups: [R,G,B][W1,W2,pad] - the two whites ride on
+        // the chip's second group (warm then cool; white_swap flips them) and
+        // the 6th output is unused, so its byte stays 0. If the whites appear
+        // dead on a particular strip, its whites are wired to G2/B2 instead of
+        // R2/G2 - the pad byte would then belong FIRST; adjust here.
+        uint8_t seq_vals[6] = {0, 0, 0, 0, 0, 0};
+        switch (config_.color_order) {
+            case ColorOrder::RGB: seq_vals[0]=r; seq_vals[1]=g; seq_vals[2]=b; break;
+            case ColorOrder::RBG: seq_vals[0]=r; seq_vals[1]=b; seq_vals[2]=g; break;
+            case ColorOrder::GRB: seq_vals[0]=g; seq_vals[1]=r; seq_vals[2]=b; break;
+            case ColorOrder::GBR: seq_vals[0]=g; seq_vals[1]=b; seq_vals[2]=r; break;
+            case ColorOrder::BRG: seq_vals[0]=b; seq_vals[1]=r; seq_vals[2]=g; break;
+            case ColorOrder::BGR: seq_vals[0]=b; seq_vals[1]=g; seq_vals[2]=r; break;
+        }
+        if (config_.format == PixelFormat::RGBCCT) {
+            seq_vals[3] = config_.white_swap ? cw : w;
+            seq_vals[4] = config_.white_swap ? w : cw;
+        } else if (config_.format == PixelFormat::RGBW) {
+            seq_vals[3] = w;
         }
 
-        if (config_.format == PixelFormat::RGBW) {
-            const uint8_t* w_seq = ws2812b_color_lookup[w];
+        for (size_t k = 0; k < channels; ++k) {
+            const uint8_t* seq = ws2812b_color_lookup[seq_vals[k]];
+            const size_t cbase = base_idx + k * WS2812B_BYTES_PER_COLOR;
             for (int j = 0; j < WS2812B_BYTES_PER_COLOR; ++j) {
-                i2s_buffer_[(base_idx + 3 * WS2812B_BYTES_PER_COLOR + j) ^ 1] = w_seq[j];
+                i2s_buffer_[(cbase + j) ^ 1] = seq[j];
             }
         }
     }
@@ -551,8 +571,11 @@ uint32_t PixelChannel::getCurrentConsumption() const noexcept {
         total_ma += (pixel.r * PixelDriver::CURRENT_PER_CHANNEL_MA) / 255;
         total_ma += (pixel.g * PixelDriver::CURRENT_PER_CHANNEL_MA) / 255;
         total_ma += (pixel.b * PixelDriver::CURRENT_PER_CHANNEL_MA) / 255;
-        if (config_.format == PixelFormat::RGBW) {
+        if (config_.format == PixelFormat::RGBW || config_.format == PixelFormat::RGBCCT) {
             total_ma += (pixel.w * PixelDriver::CURRENT_PER_CHANNEL_MA) / 255;
+        }
+        if (config_.format == PixelFormat::RGBCCT) {
+            total_ma += (pixel.cw * PixelDriver::CURRENT_PER_CHANNEL_MA) / 255;
         }
     }
 
@@ -569,7 +592,8 @@ void PixelChannel::applyCurrentScaling(float scale_factor) {
             static_cast<uint8_t>(orig.r * combined_scale),
             static_cast<uint8_t>(orig.g * combined_scale),
             static_cast<uint8_t>(orig.b * combined_scale),
-            static_cast<uint8_t>(orig.w * combined_scale)
+            static_cast<uint8_t>(orig.w * combined_scale),
+            static_cast<uint8_t>(orig.cw * combined_scale)
         );
     }
 }
@@ -736,7 +760,10 @@ namespace {
                 cJSON* ch_obj = cJSON_CreateObject();
                 cJSON_AddNumberToObject(ch_obj, "index", i);
                 cJSON_AddNumberToObject(ch_obj, "num_leds", config.pixel_count);
-                cJSON_AddStringToObject(ch_obj, "type", config.format == PixelFormat::RGB ? "RGB" : "RGBW");
+                const char* type_str = "RGB";
+                if (config.format == PixelFormat::RGBW) type_str = "RGBW";
+                else if (config.format == PixelFormat::RGBCCT) type_str = "RGBCCT";
+                cJSON_AddStringToObject(ch_obj, "type", type_str);
                 cJSON_AddItemToArray(channels, ch_obj);
             }
         }
@@ -768,6 +795,7 @@ namespace {
             return ESP_FAIL;
         }
         const EffectConfig& eff = ch->getEffectConfig();
+        const PixelFormat fmt = ch->getConfig().format;
         cJSON* ch_obj = cJSON_CreateObject();
         cJSON_AddStringToObject(ch_obj, "effect_id", eff.effect.c_str());
         cJSON_AddNumberToObject(ch_obj, "brightness", eff.brightness);
@@ -775,12 +803,18 @@ namespace {
         cJSON_AddBoolToObject(ch_obj, "on", eff.enabled);
         // Hex string per the documented LEDChannelState schema. The old {r,g,b}
         // object matched neither the docs nor the apps (which rendered it as a
-        // black swatch). The white channel is an internal detail (auto-derived
-        // by white extraction), so 6-digit RGB is the full public state.
+        // black swatch). On RGBW the white channel is an internal detail
+        // (auto-derived by white extraction), so 6-digit RGB is the full
+        // public state there. RGBCCT strips drive both whites explicitly, so
+        // they are exposed as separate w/cw fields (not packed into the hex).
         char color_hex[8];
         snprintf(color_hex, sizeof(color_hex), "#%02x%02x%02x",
             eff.color.r, eff.color.g, eff.color.b);
         cJSON_AddStringToObject(ch_obj, "color", color_hex);
+        if (fmt == PixelFormat::RGBCCT) {
+            cJSON_AddNumberToObject(ch_obj, "w", eff.color.w);    // warm white
+            cJSON_AddNumberToObject(ch_obj, "cw", eff.color.cw);  // cool white
+        }
         char* json = cJSON_Print(ch_obj);
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, json, strlen(json));
@@ -860,6 +894,17 @@ namespace {
             if (cJSON_IsNumber(g)) eff_cfg.color.g = g->valueint;
             if (cJSON_IsNumber(b)) eff_cfg.color.b = b->valueint;
             if (w && cJSON_IsNumber(w)) eff_cfg.color.w = w->valueint;
+        }
+
+        // RGBCCT white channels: top-level "w" (warm) / "cw" (cool), matching
+        // the fields the channel GET returns. 0-255 each.
+        cJSON* w_top = cJSON_GetObjectItem(json, "w");
+        cJSON* cw_top = cJSON_GetObjectItem(json, "cw");
+        if (w_top && cJSON_IsNumber(w_top)) {
+            eff_cfg.color.w = static_cast<uint8_t>(w_top->valueint);
+        }
+        if (cw_top && cJSON_IsNumber(cw_top)) {
+            eff_cfg.color.cw = static_cast<uint8_t>(cw_top->valueint);
         }
 
         ch->setEffect(eff_cfg);

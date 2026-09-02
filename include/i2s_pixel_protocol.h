@@ -21,7 +21,14 @@ extern "C" {
 #define WS2812B_BYTES_PER_RGBW   (WS2812B_BYTES_PER_COLOR * WS2812B_COLORS_PER_RGBW)  // 12 bytes
 
 #define WS2812B_BITRATE      2600000UL   // 2.6 Mbps = 385 ns/bit
-#define WS2812B_RESET_BITS   ((50 * WS2812B_BITRATE / 1000000UL) + 1) // 50 uS of zero bits
+
+// Frame reset (latch) time, held low after the pixel data. Sized for the
+// slowest supported IC: FW1906 requires 200-500us (datasheet Table 6) - the
+// old 50us was below its minimum, so latching was marginal. WS2812 (>=50us)
+// and SK6812 (>=80us) simply see a longer-than-needed reset. Cost: ~100
+// buffer bytes and +250us of frame latency - negligible at any frame rate.
+#define WS2812B_RESET_US     300
+#define WS2812B_RESET_BITS   ((WS2812B_RESET_US * WS2812B_BITRATE / 1000000UL) + 1)
 #define WS2812B_RESET_BYTES  ((WS2812B_RESET_BITS + 7) / 8) // Zero bytes for reset
 
 // Lookup table type for color encoding

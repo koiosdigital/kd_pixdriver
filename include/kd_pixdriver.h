@@ -29,10 +29,21 @@ struct ChannelConfig {
     uint32_t resolution_hz = 10000000;  // 10MHz default
     std::string name;
 
+    // Strip wiring (per-IC). color_order reorders the R/G/B bytes; white_swap
+    // flips the order of the two white bytes (RGBCCT only). ic_type is mostly
+    // informational since all supported ICs share WS2812 800kHz timing.
+    LedICType ic_type = LedICType::WS2812;
+    ColorOrder color_order = ColorOrder::GRB;  // WS2812 default
+    bool white_swap = false;
+
     ChannelConfig(gpio_num_t gpio_pin, uint16_t count,
                   PixelFormat fmt = PixelFormat::RGB,
-                  std::string_view channel_name = "")
-        : pin(gpio_pin), pixel_count(count), format(fmt), name(channel_name) {}
+                  std::string_view channel_name = "",
+                  LedICType ic = LedICType::WS2812,
+                  ColorOrder order = ColorOrder::GRB,
+                  bool swap_white = false)
+        : pin(gpio_pin), pixel_count(count), format(fmt), name(channel_name),
+          ic_type(ic), color_order(order), white_swap(swap_white) {}
 };
 
 struct EffectConfig {

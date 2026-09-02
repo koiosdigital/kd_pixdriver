@@ -20,20 +20,57 @@ inline const char* getPixelDriverBuildTime() {
     return PIXDRIVER_BUILD_TIMESTAMP;
 }
 
+// Number of LOGICAL color channels per pixel. The enum value IS the logical
+// channel count. NOTE: the number of bytes emitted on the wire can differ -
+// see wireChannelCount().
 enum class PixelFormat : uint8_t {
-    RGB = 3,
-    RGBW = 4
+    RGB    = 3,  // r,g,b
+    RGBW   = 4,  // r,g,b + single white
+    RGBCCT = 5   // r,g,b + warm white (w) + cool white (cw)  (e.g. FW1906)
+};
+
+// LED controller IC family. Selects timing/reset behavior. All currently
+// supported ICs use WS2812-compatible 800kHz single-wire encoding, so this
+// mainly documents the strip and drives the default channel layout.
+enum class LedICType : uint8_t {
+    WS2812 = 0,  // 3ch RGB
+    SK6812 = 1,  // 4ch RGBW
+    FW1906 = 2   // 6-channel: TWO RGB groups per chip (RGBCCT uses 5 of 6)
+};
+
+// Color channels per pixel ON THE WIRE. The FW1906 (the RGBCCT driver IC) is
+// a six-channel chip: its data frame is 48 bits = two complete 24-bit RGB
+// groups (datasheet "data structure": group 1 = OUTR1/G1/B1, group 2 =
+// OUTR2/G2/B2). An RGBCCT pixel therefore occupies SIX wire bytes -
+// [R,G,B] on group 1, the two whites on group 2, one output unused - even
+// though only 5 carry color. Emitting 5 (the old behavior) slipped the
+// stream by one byte per chip, rotating the channels across the strip.
+[[nodiscard]] inline constexpr uint8_t wireChannelCount(PixelFormat format) noexcept {
+    return format == PixelFormat::RGBCCT ? 6 : static_cast<uint8_t>(format);
+}
+
+// Order the R/G/B bytes are emitted on the wire (per-strip). White channels,
+// when present, are always emitted after the RGB triple (see white_swap).
+enum class ColorOrder : uint8_t {
+    RGB = 0,
+    RBG = 1,
+    GRB = 2,  // WS2812 default
+    GBR = 3,
+    BRG = 4,
+    BGR = 5
 };
 
 struct PixelColor {
     uint8_t r = 0;
     uint8_t g = 0;
     uint8_t b = 0;
-    uint8_t w = 0;
+    uint8_t w = 0;   // white (RGBW) / warm white (RGBCCT)
+    uint8_t cw = 0;  // cool white (RGBCCT only)
 
     constexpr PixelColor() = default;
-    constexpr PixelColor(uint8_t red, uint8_t green, uint8_t blue, uint8_t white = 0) noexcept
-        : r(red), g(green), b(blue), w(white) {}
+    constexpr PixelColor(uint8_t red, uint8_t green, uint8_t blue,
+                         uint8_t white = 0, uint8_t cool_white = 0) noexcept
+        : r(red), g(green), b(blue), w(white), cw(cool_white) {}
 
     // Create from 32-bit RGB/RGBW value
     static constexpr PixelColor fromRGB(uint32_t rgb) noexcept {
@@ -74,7 +111,8 @@ struct PixelColor {
             static_cast<uint8_t>((r * brightness) / 255),
             static_cast<uint8_t>((g * brightness) / 255),
             static_cast<uint8_t>((b * brightness) / 255),
-            static_cast<uint8_t>((w * brightness) / 255)
+            static_cast<uint8_t>((w * brightness) / 255),
+            static_cast<uint8_t>((cw * brightness) / 255)
         );
     }
 
@@ -85,7 +123,8 @@ struct PixelColor {
             static_cast<uint8_t>((r * inv + other.r * amount) / 255),
             static_cast<uint8_t>((g * inv + other.g * amount) / 255),
             static_cast<uint8_t>((b * inv + other.b * amount) / 255),
-            static_cast<uint8_t>((w * inv + other.w * amount) / 255)
+            static_cast<uint8_t>((w * inv + other.w * amount) / 255),
+            static_cast<uint8_t>((cw * inv + other.cw * amount) / 255)
         );
     }
 
@@ -100,7 +139,8 @@ struct PixelColor {
     static constexpr PixelColor Magenta() noexcept { return PixelColor(255, 0, 255); }
 
     constexpr bool operator==(const PixelColor& other) const noexcept {
-        return r == other.r && g == other.g && b == other.b && w == other.w;
+        return r == other.r && g == other.g && b == other.b &&
+               w == other.w && cw == other.cw;
     }
     constexpr bool operator!=(const PixelColor& other) const noexcept {
         return !(*this == other);
