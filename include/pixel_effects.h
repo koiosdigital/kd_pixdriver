@@ -6,14 +6,16 @@
 #include <vector>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <functional>
-#include <array>
 
 class PixelEffectEngine {
 public:
     explicit PixelEffectEngine(uint32_t update_rate_hz);
 
+    /// Render one frame of `channel`'s effect into its pixel buffer at FULL
+    /// scale - brightness and current limiting are applied afterwards by the
+    /// driver. Called by the driver task under PixelDriver::Lock. Empty
+    /// buffers are skipped.
     void updateEffect(PixelChannel* channel, uint32_t tick);
 
     // Effect registration
@@ -24,18 +26,37 @@ public:
 
     using EffectFn = std::function<void(PixelEffectEngine*, PixelChannel*, uint32_t)>;
 
+    /// Register (or replace, case-insensitively by id) an effect. Do not call
+    /// from inside an effect callback.
     void registerEffect(std::string_view name, std::string_view display_name, EffectFn fn);
     void unregisterEffect(std::string_view name);
     [[nodiscard]] std::vector<EffectInfo> getAllEffects() const;
+
+    // Index-based dispatch. A channel resolves its effect id once (when the
+    // effect is set) and caches the index; the registry generation lets it
+    // notice (un)registrations or an engine rebuild and re-resolve, so no
+    // string hashing happens per frame.
+    static constexpr int kEffectUnknown = -1;  // unknown id: falls back to SOLID
+    static constexpr int kEffectRaw = -2;      // "RAW": firmware writes the buffer directly
+    [[nodiscard]] int resolveEffect(std::string_view id) const;
+    [[nodiscard]] uint32_t registryGeneration() const noexcept { return generation_; }
+
+    /// Forget a channel's animation state (call when a channel id is reused).
+    void resetChannelState(int32_t channel_id);
 
 private:
     uint32_t update_rate_hz_;
 
     struct EffectEntry {
-        EffectFn fn;
+        std::string id;
         std::string display_name;
+        EffectFn fn;
+        bool active;  // unregister deactivates in place so indices stay stable
     };
-    std::unordered_map<std::string, EffectEntry> effect_registry_;
+    std::vector<EffectEntry> effects_;
+    uint32_t generation_;
+
+    [[nodiscard]] int findEntry(std::string_view id) const;
 
     // Built-in effect implementations
     void applySolid(PixelChannel* channel);
@@ -57,26 +78,8 @@ private:
     void applyMeteor(PixelChannel* channel, uint32_t tick);
     void applyRunningLights(PixelChannel* channel, uint32_t tick);
 
-    // Effect state - using a more memory-efficient approach
-    struct EffectState {
-        uint32_t last_update_tick = 0;
-        uint32_t phase = 0;
-        uint8_t counter = 0;
-        bool direction = false;
-
-        // Union for effect-specific state to save memory
-        union {
-            struct { uint8_t brightness; bool increasing; } breathe;
-            struct { uint16_t pixel; bool clearing; } wipe;
-            struct { uint8_t offset; } chase;
-            struct { uint8_t offset; } rainbow;
-            struct { uint8_t offset; } cyclic;
-            struct { int16_t head; uint8_t tail_length; } comet;
-            struct { uint8_t position; } wave;
-            struct { uint8_t heat[64]; } fire;  // Heat map for fire effect
-        };
-    };
-
+    // Per-channel animation state, indexed by channel id (EffectState and
+    // SIN_TABLE come from pixel_core.h, shared with the WASM preview).
     std::vector<EffectState> channel_states_;
 
     // Helper functions
@@ -85,24 +88,4 @@ private:
 
     // Utility for gamma correction
     [[nodiscard]] static uint8_t gammaCorrect(uint8_t value) noexcept;
-
-    // Sin wave lookup for smooth animations (256 entries, 0-255 output)
-    static constexpr std::array<uint8_t, 256> generateSinTable() {
-        std::array<uint8_t, 256> table{};
-        for (int i = 0; i < 256; ++i) {
-            // Using integer approximation of sin
-            int angle = i;
-            int result;
-            if (angle < 128) {
-                result = (angle < 64) ? angle * 4 : (128 - angle) * 4;
-            } else {
-                angle -= 128;
-                result = (angle < 64) ? -(angle * 4) : -((128 - angle) * 4);
-            }
-            table[i] = static_cast<uint8_t>((result + 256) / 2);
-        }
-        return table;
-    }
-
-    static const std::array<uint8_t, 256> sin_table_;
 };

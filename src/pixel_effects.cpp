@@ -35,14 +35,21 @@ inline bool equalsIgnoreCase(std::string_view a, std::string_view b) {
     return true;
 }
 
+// Registry generations are unique across engine instances so a channel that
+// cached an index from a previous engine (setUpdateRate rebuilds it)
+// re-resolves against the new one. 0 is reserved for "never resolved".
+uint32_t nextGeneration() {
+    static uint32_t counter = 0;
+    return ++counter;
+}
+
 } // anonymous namespace
 
-// Static member initialization
-const std::array<uint8_t, 256> PixelEffectEngine::sin_table_ = PixelEffectEngine::generateSinTable();
-
 PixelEffectEngine::PixelEffectEngine(uint32_t update_rate_hz)
-    : update_rate_hz_(update_rate_hz) {
+    : update_rate_hz_(update_rate_hz)
+    , generation_(nextGeneration()) {
     channel_states_.reserve(4);
+    effects_.reserve(16);
 
     // Register all built-in effects
     auto reg = [this](std::string_view id, std::string_view name, auto fn) {
@@ -77,32 +84,51 @@ PixelEffectEngine::PixelEffectEngine(uint32_t update_rate_hz)
 void PixelEffectEngine::updateEffect(PixelChannel* channel, uint32_t tick) {
     if (!channel) return;
 
-    const auto& config = channel->getEffectConfig();
+    auto& buffer = channel->getPixelBuffer();
+    if (buffer.empty()) return;  // several effects divide by the size
+
+    const EffectConfig& config = channel->getEffectConfig();
     ensureChannelState(channel->getId());
 
-    const std::string& effect_name = config.effect;
-
-    // Raw mode - firmware manages buffer directly
-    if (equalsIgnoreCase(effect_name, "RAW")) {
+    // App-supplied renderer takes precedence over the named effect.
+    if (config.custom_effect) {
+        config.custom_effect(buffer, tick);
         return;
     }
 
-    // Try exact match first (common case)
-    if (auto it = effect_registry_.find(effect_name); it != effect_registry_.end()) {
-        it->second.fn(this, channel, tick);
+    const int idx = channel->effectIndex(*this);
+    if (idx == kEffectRaw) return;  // firmware manages the buffer directly
+    if (idx >= 0 && static_cast<size_t>(idx) < effects_.size() && effects_[idx].active) {
+        const EffectFn& fn = effects_[idx].fn;
+        fn(this, channel, tick);
         return;
     }
 
-    // Try case-insensitive search
-    for (const auto& [key, entry] : effect_registry_) {
-        if (equalsIgnoreCase(key, effect_name)) {
-            entry.fn(this, channel, tick);
-            return;
-        }
-    }
-
-    // Fallback to solid
+    // Unknown / unregistered effect: fall back to solid
     applySolid(channel);
+}
+
+int PixelEffectEngine::findEntry(std::string_view id) const {
+    for (size_t i = 0; i < effects_.size(); ++i) {
+        if (effects_[i].id == id) return static_cast<int>(i);
+    }
+    for (size_t i = 0; i < effects_.size(); ++i) {
+        if (equalsIgnoreCase(effects_[i].id, id)) return static_cast<int>(i);
+    }
+    return kEffectUnknown;
+}
+
+int PixelEffectEngine::resolveEffect(std::string_view id) const {
+    if (equalsIgnoreCase(id, "RAW")) return kEffectRaw;
+    const int idx = findEntry(id);
+    return (idx >= 0 && effects_[idx].active) ? idx : kEffectUnknown;
+}
+
+void PixelEffectEngine::resetChannelState(int32_t channel_id) {
+    if (channel_id < 0) return;
+    if (static_cast<size_t>(channel_id) < channel_states_.size()) {
+        channel_states_[channel_id] = EffectState();
+    }
 }
 
 void PixelEffectEngine::applySolid(PixelChannel* channel) {
@@ -194,9 +220,11 @@ void PixelEffectEngine::applyRainbow(PixelChannel* channel, uint32_t tick) {
         state.last_update_tick = tick;
     }
 
+    // Full-scale value: brightness is applied once, by the driver's scaling
+    // pass (applying it here too dimmed the rainbow quadratically).
     for (size_t i = 0; i < size; ++i) {
         const uint8_t hue = static_cast<uint8_t>((i * 256 / size) + state.rainbow.offset);
-        buffer[i] = PixelColor::fromHSV(hue, 255, config.brightness);
+        buffer[i] = PixelColor::fromHSV(hue, 255, 255);
     }
 }
 
@@ -304,17 +332,18 @@ void PixelEffectEngine::applyFire(PixelChannel* channel, uint32_t tick) {
 
     const uint32_t interval = getEffectInterval(config.speed) / 2;
     const size_t size = buffer.size();
+    const size_t heat_cells = std::min(size, size_t(64));
 
     if (tick - state.last_update_tick >= interval) {
         // Cool down every cell
-        for (size_t i = 0; i < std::min(size, size_t(64)); ++i) {
+        for (size_t i = 0; i < heat_cells; ++i) {
             const uint8_t cooldown = fastRandomByte() % ((55 * 10 / size) + 2);
             state.fire.heat[i] = (state.fire.heat[i] > cooldown) ?
                 state.fire.heat[i] - cooldown : 0;
         }
 
         // Heat rises - diffuse upward
-        for (size_t i = std::min(size, size_t(64)) - 1; i >= 2; --i) {
+        for (size_t i = heat_cells - 1; i >= 2 && i < heat_cells; --i) {
             state.fire.heat[i] = (state.fire.heat[i - 1] +
                                   state.fire.heat[i - 2] +
                                   state.fire.heat[i - 2]) / 3;
@@ -322,7 +351,7 @@ void PixelEffectEngine::applyFire(PixelChannel* channel, uint32_t tick) {
 
         // Randomly ignite new sparks at bottom
         if (fastRandomByte() < 120) {
-            const int pos = fastRandomByte() % std::min(7, static_cast<int>(size));
+            const int pos = fastRandomByte() % std::min(7, static_cast<int>(heat_cells));
             state.fire.heat[pos] = std::min(255,
                 state.fire.heat[pos] + 160 + (fastRandomByte() % 96));
         }
@@ -330,7 +359,7 @@ void PixelEffectEngine::applyFire(PixelChannel* channel, uint32_t tick) {
         state.last_update_tick = tick;
     }
 
-    // Map heat to color
+    // Map heat to color (full scale; brightness is applied by the driver)
     for (size_t i = 0; i < size; ++i) {
         const uint8_t heat = (i < 64) ? state.fire.heat[i] : 0;
         // Heat color: black -> red -> orange -> yellow -> white
@@ -348,7 +377,7 @@ void PixelEffectEngine::applyFire(PixelChannel* channel, uint32_t tick) {
             g = 255;
             b = (heat - 170) * 3;
         }
-        buffer[i] = PixelColor(r, g, b).scale(config.brightness);
+        buffer[i] = PixelColor(r, g, b);
     }
 }
 
@@ -370,7 +399,7 @@ void PixelEffectEngine::applyWave(PixelChannel* channel, uint32_t tick) {
         const uint8_t phase = static_cast<uint8_t>(
             (i * 256 / size) + state.wave.position
         );
-        const uint8_t brightness = sin_table_[phase];
+        const uint8_t brightness = SIN_TABLE[phase];
         buffer[i] = config.color.scale(brightness);
     }
 }
@@ -420,7 +449,7 @@ void PixelEffectEngine::applyGradient(PixelChannel* channel, uint32_t tick) {
 
     for (size_t i = 0; i < size; ++i) {
         const uint8_t pos = static_cast<uint8_t>((i * 256 / size) + state.phase);
-        const uint8_t blend_amount = sin_table_[pos];
+        const uint8_t blend_amount = SIN_TABLE[pos];
         buffer[i] = config.color.blend(complement, blend_amount);
     }
 }
@@ -505,7 +534,7 @@ void PixelEffectEngine::applyRunningLights(PixelChannel* channel, uint32_t tick)
 
     for (size_t i = 0; i < size; ++i) {
         // Create running wave pattern
-        const uint8_t wave = sin_table_[(i * 32 + state.phase * 4) & 0xFF];
+        const uint8_t wave = SIN_TABLE[(i * 32 + state.phase * 4) & 0xFF];
         buffer[i] = config.color.scale(wave);
     }
 }
@@ -519,6 +548,7 @@ uint32_t PixelEffectEngine::getEffectInterval(uint8_t speed) const noexcept {
 }
 
 void PixelEffectEngine::ensureChannelState(int32_t channel_id) {
+    if (channel_id < 0) return;
     if (channel_id >= static_cast<int32_t>(channel_states_.size())) {
         channel_states_.resize(channel_id + 1);
     }
@@ -529,18 +559,33 @@ uint8_t PixelEffectEngine::gammaCorrect(uint8_t value) noexcept {
 }
 
 void PixelEffectEngine::registerEffect(std::string_view name, std::string_view display_name, EffectFn fn) {
-    effect_registry_[std::string(name)] = EffectEntry{std::move(fn), std::string(display_name)};
+    const int existing = findEntry(name);
+    if (existing >= 0) {
+        // Replace in place: channels holding this index keep working.
+        effects_[existing].display_name = std::string(display_name);
+        effects_[existing].fn = std::move(fn);
+        effects_[existing].active = true;
+    }
+    else {
+        effects_.push_back(EffectEntry{ std::string(name), std::string(display_name), std::move(fn), true });
+    }
+    generation_ = nextGeneration();
 }
 
 void PixelEffectEngine::unregisterEffect(std::string_view name) {
-    effect_registry_.erase(std::string(name));
+    const int existing = findEntry(name);
+    if (existing < 0) return;
+    // Deactivate rather than erase so other effects' indices stay valid.
+    effects_[existing].active = false;
+    effects_[existing].fn = nullptr;
+    generation_ = nextGeneration();
 }
 
 std::vector<PixelEffectEngine::EffectInfo> PixelEffectEngine::getAllEffects() const {
     std::vector<EffectInfo> effects;
-    effects.reserve(effect_registry_.size());
-    for (const auto& [id, entry] : effect_registry_) {
-        effects.push_back({id, entry.display_name});
+    effects.reserve(effects_.size());
+    for (const auto& entry : effects_) {
+        if (entry.active) effects.push_back({ entry.id, entry.display_name });
     }
     return effects;
 }

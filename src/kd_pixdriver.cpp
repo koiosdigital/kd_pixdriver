@@ -2,131 +2,249 @@
 #include "pixel_effects.h"
 #include "pixel_version.h"
 #include "i2s_pixel_protocol.h"
+#include "sdkconfig.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs.h"
-#include "cJSON.h"
 #include "driver/i2s_std.h"
 #include "driver/i2s_common.h"
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+
+#if CONFIG_KD_PIXDRIVER_HTTP_API
+#include "cJSON.h"
+#endif
 
 namespace {
     constexpr const char* TAG = "kd_pixdriver";
     constexpr const char* NVS_NAMESPACE = "pixdriver";
+
+    // Below the Wi-Fi task (23) - a frame that starts a few hundred µs late
+    // is invisible, a starved Wi-Fi driver is not - and above the driver task.
+    constexpr UBaseType_t I2S_TASK_PRIORITY = 20;
+    constexpr UBaseType_t DRIVER_TASK_PRIORITY = 7;
+    constexpr uint32_t DRIVER_TASK_STACK = 4096;
+    // stop() join budget: a frame plus one NVS write (done outside the lock).
+    constexpr TickType_t STOP_JOIN_TIMEOUT = pdMS_TO_TICKS(500);
+    // The driver task takes the lock with a timeout so a stop() issued by a
+    // task that already holds the lock is observed promptly.
+    constexpr TickType_t RENDER_LOCK_TIMEOUT = pdMS_TO_TICKS(20);
+    // A transmit that never completes (DMA callback lost) must not wedge the
+    // I2S task forever - the channel is disabled and the next frame retried.
+    constexpr TickType_t TRANSMIT_COMPLETE_TIMEOUT = pdMS_TO_TICKS(1000);
+    constexpr int64_t NVS_SETTLE_US = 2000000;  // 2s after the last change
+
+    // Persisted per-strip settings are keyed by the data pin ("ch_p<pin>:x"),
+    // which is what identifies a strip across reconfigures and reboots; the
+    // pre-stable-id layout ("ch_<id>:x") is migrated on first load.
+    constexpr const char* NVS_SUFFIXES[] = { "eff", "col", "brt", "spd", "on" };
+
+    void nvsKey(char* out, size_t out_size, gpio_num_t pin, const char* suffix) {
+        snprintf(out, out_size, "ch_p%d:%s", static_cast<int>(pin), suffix);
+    }
+
+    void legacyNvsKey(char* out, size_t out_size, int32_t id, const char* suffix) {
+        snprintf(out, out_size, "ch_%ld:%s", static_cast<long>(id), suffix);
+    }
+
+    // Created on first use; C++11 guarantees the initialisation is thread-safe
+    // (ESP-IDF implements __cxa_guard_* on FreeRTOS).
+    SemaphoreHandle_t driverLock() {
+        static SemaphoreHandle_t handle = xSemaphoreCreateRecursiveMutex();
+        return handle;
+    }
+
+    // Per-frame lock acquisition for the driver task (timed; see stop()).
+    bool tryLockFor(TickType_t ticks) {
+        SemaphoreHandle_t h = driverLock();
+        if (!h) return true;  // no mutex (allocation failed at boot): run unlocked
+        return xSemaphoreTakeRecursive(h, ticks) == pdTRUE;
+    }
+
+    void unlock() {
+        if (SemaphoreHandle_t h = driverLock()) xSemaphoreGiveRecursive(h);
+    }
 } // anonymous namespace
+
+// ============= PixelDriver::Lock =============
+
+PixelDriver::Lock::Lock() {
+    if (SemaphoreHandle_t h = driverLock()) xSemaphoreTakeRecursive(h, portMAX_DELAY);
+}
+
+PixelDriver::Lock::~Lock() {
+    unlock();
+}
 
 // Static member definitions
 std::vector<std::unique_ptr<PixelChannel>> PixelDriver::channels_;
 std::unique_ptr<PixelEffectEngine> PixelDriver::effect_engine_;
 int32_t PixelDriver::main_channel_id_ = -1;
 TaskHandle_t PixelDriver::task_handle_ = nullptr;
+SemaphoreHandle_t PixelDriver::task_exit_sem_ = nullptr;
 int32_t PixelDriver::current_limit_ma_ = -1;
 uint32_t PixelDriver::update_rate_hz_ = 60;
-bool PixelDriver::running_ = false;
-int32_t PixelDriver::next_channel_id_ = 0;
+std::atomic<bool> PixelDriver::running_{ false };
+std::atomic<bool> PixelDriver::task_alive_{ false };
 bool PixelDriver::initialized_ = false;
 
-// I2S callback function
+// I2S callback function (ISR context; IRAM-safe: touches only the channel
+// object and the semaphore, both in internal RAM)
 extern "C" IRAM_ATTR bool i2s_tx_callback(i2s_chan_handle_t handle,
     i2s_event_data_t* event,
     void* user_ctx) {
+    (void)handle;
     auto* channel = static_cast<PixelChannel*>(user_ctx);
-    if (channel && event) {
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    if (channel && event && channel->complete_semaphore_) {
         channel->bytes_sent_ += event->size;
         if (channel->bytes_sent_ >= channel->i2s_buffer_.size()) {
-            BaseType_t higher_priority_task_woken = pdFALSE;
             xSemaphoreGiveFromISR(channel->complete_semaphore_, &higher_priority_task_woken);
         }
     }
-    return false;
+    return higher_priority_task_woken == pdTRUE;
 }
 
 // ============= PixelDriver Implementation =============
 
 void PixelDriver::initialize(uint32_t update_rate_hz) {
+    Lock lock;
     if (initialized_) return;
 
-    update_rate_hz_ = update_rate_hz;
-    effect_engine_ = std::make_unique<PixelEffectEngine>(update_rate_hz);
+    update_rate_hz_ = std::clamp<uint32_t>(update_rate_hz, 1, 1000);
+    effect_engine_ = std::make_unique<PixelEffectEngine>(update_rate_hz_);
     initialized_ = true;
-    ESP_LOGI(TAG, "PixelDriver initialized at %lu Hz", update_rate_hz);
+    ESP_LOGI(TAG, "PixelDriver initialized at %lu Hz", static_cast<unsigned long>(update_rate_hz_));
 }
 
 void PixelDriver::shutdown() {
+    stop();
+    Lock lock;
     if (!initialized_) return;
 
-    stop();
     channels_.clear();
     effect_engine_.reset();
     main_channel_id_ = -1;
-    next_channel_id_ = 0;
     initialized_ = false;
     ESP_LOGI(TAG, "PixelDriver shutdown");
 }
 
 int32_t PixelDriver::addChannel(const ChannelConfig& config) {
+    Lock lock;
     if (!initialized_) {
         ESP_LOGE(TAG, "PixelDriver not initialized");
         return -1;
     }
 
-    const int32_t id = next_channel_id_++;
+    // Lowest free id: ids are what the API exposes and index the effect
+    // engine's state table, so a remove/add reconfigure must hand back the
+    // same id rather than an ever-increasing one.
+    int32_t id = 0;
+    while (getChannel(id) != nullptr) ++id;
+
     auto channel = std::make_unique<PixelChannel>(id, config);
 
     if (!channel->initialize()) {
-        ESP_LOGE(TAG, "Failed to initialize channel %ld", id);
+        ESP_LOGE(TAG, "Failed to initialize channel %ld", static_cast<long>(id));
         return -1;
     }
 
     channel->loadFromNVS();
+    if (effect_engine_) effect_engine_->resetChannelState(id);
 
     if (main_channel_id_ == -1) {
         main_channel_id_ = id;
-        ESP_LOGI(TAG, "Set channel %ld as main", id);
+        ESP_LOGI(TAG, "Set channel %ld as main", static_cast<long>(id));
     }
 
-    ESP_LOGI(TAG, "Added channel %ld: pin %d, %d pixels, %s",
-        id, config.pin, config.pixel_count,
-        config.format == PixelFormat::RGBW ? "RGBW" : "RGB");
+    ESP_LOGI(TAG, "Added channel %ld: pin %d, %u pixels, %s",
+        static_cast<long>(id), static_cast<int>(config.pin), static_cast<unsigned>(config.pixel_count),
+        config.format == PixelFormat::RGBW ? "RGBW"
+            : config.format == PixelFormat::RGBCCT ? "RGBCCT" : "RGB");
 
     channels_.emplace_back(std::move(channel));
     return id;
 }
 
-bool PixelDriver::removeChannel(int32_t channel_id) {
+bool PixelDriver::removeChannel(int32_t channel_id, bool persist_forget) {
+    // The driver task holds the lock for the CPU part of every frame, so
+    // once we have it nobody is inside this channel.
+    Lock lock;
     auto it = std::find_if(channels_.begin(), channels_.end(),
         [channel_id](const auto& ch) { return ch->getId() == channel_id; });
 
     if (it == channels_.end()) return false;
 
+    PixelChannel* ch = it->get();
+    if (persist_forget) {
+        forgetChannelSettings(ch->getConfig().pin);
+    }
+    else {
+        // A change still inside the settle window would otherwise be lost
+        // by the app's stop/remove/add reconfigure sequence.
+        ch->flushPendingSave();
+    }
+    if (effect_engine_) effect_engine_->resetChannelState(channel_id);
+
     if (main_channel_id_ == channel_id) {
         main_channel_id_ = -1;
-        for (const auto& ch : channels_) {
-            if (ch->getId() != channel_id) {
-                main_channel_id_ = ch->getId();
-                ESP_LOGI(TAG, "Set channel %ld as new main", main_channel_id_);
+        for (const auto& other : channels_) {
+            if (other->getId() != channel_id) {
+                main_channel_id_ = other->getId();
+                ESP_LOGI(TAG, "Set channel %ld as new main", static_cast<long>(main_channel_id_));
                 break;
             }
         }
     }
 
-    channels_.erase(it);
-    ESP_LOGI(TAG, "Removed channel %ld", channel_id);
+    channels_.erase(it);  // ~PixelChannel joins its I2S task and releases the peripheral
+    ESP_LOGI(TAG, "Removed channel %ld%s", static_cast<long>(channel_id),
+        persist_forget ? " (settings erased)" : "");
     return true;
 }
 
+bool PixelDriver::forgetChannelSettings(gpio_num_t pin) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "forgetChannelSettings: nvs_open failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    bool ok = true;
+    char key[16];
+    for (const char* suffix : NVS_SUFFIXES) {
+        nvsKey(key, sizeof(key), pin, suffix);
+        err = nvs_erase_key(handle, key);
+        if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(TAG, "nvs_erase_key(%s) failed: %s", key, esp_err_to_name(err));
+            ok = false;
+        }
+    }
+    err = nvs_commit(handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "nvs_commit failed: %s", esp_err_to_name(err));
+        ok = false;
+    }
+    nvs_close(handle);
+    return ok;
+}
+
 PixelChannel* PixelDriver::getChannel(int32_t channel_id) {
+    Lock lock;
     auto it = std::find_if(channels_.begin(), channels_.end(),
         [channel_id](const auto& ch) { return ch->getId() == channel_id; });
     return (it != channels_.end()) ? it->get() : nullptr;
 }
 
 PixelChannel* PixelDriver::getMainChannel() {
+    Lock lock;
     return (main_channel_id_ != -1) ? getChannel(main_channel_id_) : nullptr;
 }
 
 std::vector<int32_t> PixelDriver::getChannelIds() {
+    Lock lock;
     std::vector<int32_t> ids;
     ids.reserve(channels_.size());
     for (const auto& ch : channels_) {
@@ -136,71 +254,135 @@ std::vector<int32_t> PixelDriver::getChannelIds() {
 }
 
 void PixelDriver::setCurrentLimit(int32_t limit_ma) {
+    Lock lock;
     current_limit_ma_ = limit_ma;
-    ESP_LOGI(TAG, "Current limit: %ld mA", limit_ma);
+    ESP_LOGI(TAG, "Current limit: %ld mA", static_cast<long>(limit_ma));
 }
 
 int32_t PixelDriver::getCurrentLimit() noexcept {
+    Lock lock;
     return current_limit_ma_;
 }
 
-void PixelDriver::setUpdateRate(uint32_t rate_hz) {
-    update_rate_hz_ = rate_hz;
-    effect_engine_ = std::make_unique<PixelEffectEngine>(rate_hz);
+bool PixelDriver::setUpdateRate(uint32_t rate_hz) {
+    Lock lock;
+    if (rate_hz == 0) return false;
+    if (running_.load(std::memory_order_acquire)) {
+        ESP_LOGE(TAG, "setUpdateRate: stop the driver first");
+        return false;
+    }
+    update_rate_hz_ = std::clamp<uint32_t>(rate_hz, 1, 1000);
+    if (initialized_) {
+        // Channels re-resolve their effect index against the new engine
+        // (its registry generation differs).
+        effect_engine_ = std::make_unique<PixelEffectEngine>(update_rate_hz_);
+    }
+    return true;
 }
 
 uint32_t PixelDriver::getUpdateRate() noexcept {
     return update_rate_hz_;
 }
 
-void PixelDriver::start() {
-    if (running_ || !initialized_) return;
+bool PixelDriver::start() {
+    Lock lock;
+    if (!initialized_) {
+        ESP_LOGE(TAG, "start: PixelDriver not initialized");
+        return false;
+    }
+    if (running_.load(std::memory_order_acquire)) return true;
 
-    running_ = true;
-    xTaskCreate(driverTask, "pixdriver", 4096, nullptr, 7, &task_handle_);
+    if (!task_exit_sem_) {
+        task_exit_sem_ = xSemaphoreCreateBinary();
+        if (!task_exit_sem_) {
+            ESP_LOGE(TAG, "start: failed to create exit semaphore");
+            return false;
+        }
+    }
+
+    // A previous stop() may have timed out with the task still unwinding.
+    // Never run two driver tasks: wait a little longer, then refuse.
+    if (task_alive_.load(std::memory_order_acquire)) {
+        if (xSemaphoreTake(task_exit_sem_, STOP_JOIN_TIMEOUT) != pdTRUE &&
+            task_alive_.load(std::memory_order_acquire)) {
+            ESP_LOGE(TAG, "start: previous driver task still running");
+            return false;
+        }
+    }
+    xSemaphoreTake(task_exit_sem_, 0);  // clear a stale give
+
+    running_.store(true, std::memory_order_release);
+    task_alive_.store(true, std::memory_order_release);
+    if (xTaskCreate(driverTask, "pixdriver", DRIVER_TASK_STACK, nullptr,
+        DRIVER_TASK_PRIORITY, &task_handle_) != pdPASS) {
+        running_.store(false, std::memory_order_release);
+        task_alive_.store(false, std::memory_order_release);
+        task_handle_ = nullptr;
+        ESP_LOGE(TAG, "start: failed to create driver task");
+        return false;
+    }
     ESP_LOGI(TAG, "PixelDriver started");
+    return true;
 }
 
 void PixelDriver::stop() {
-    if (!running_) return;
+    if (!running_.exchange(false, std::memory_order_acq_rel)) return;
 
-    running_ = false;
-    if (task_handle_) {
-        vTaskDelete(task_handle_);
-        task_handle_ = nullptr;
+    if (task_handle_ && xTaskGetCurrentTaskHandle() == task_handle_) {
+        // From an effect callback: the loop sees running_ == false after
+        // this frame and exits; joining ourselves is impossible.
+        ESP_LOGW(TAG, "stop() called from the driver task; exiting after this frame");
+        return;
     }
-    ESP_LOGI(TAG, "PixelDriver stopped");
+
+    // Join. The task never blocks on the driver lock indefinitely (timed
+    // take), so this works even when the caller holds PixelDriver::Lock.
+    const bool exited = task_exit_sem_ &&
+        xSemaphoreTake(task_exit_sem_, STOP_JOIN_TIMEOUT) == pdTRUE;
+    if (exited) {
+        task_handle_ = nullptr;
+        ESP_LOGI(TAG, "PixelDriver stopped");
+    }
+    else {
+        ESP_LOGE(TAG, "Driver task did not exit within %u ms; it will finish on its own",
+            static_cast<unsigned>(STOP_JOIN_TIMEOUT * portTICK_PERIOD_MS));
+    }
 }
 
 bool PixelDriver::isRunning() noexcept {
-    return running_;
+    return running_.load(std::memory_order_acquire);
 }
 
 void PixelDriver::setAllChannelsEffect(std::string_view effect_id) {
+    Lock lock;
     for (auto& ch : channels_) {
         ch->setEffectByID(effect_id);
     }
 }
 
 void PixelDriver::setAllChannelsColor(const PixelColor& color) {
+    Lock lock;
     for (auto& ch : channels_) {
         ch->setColor(color);
     }
 }
 
 void PixelDriver::setAllChannelsBrightness(uint8_t brightness) {
+    Lock lock;
     for (auto& ch : channels_) {
         ch->setBrightness(brightness);
     }
 }
 
 void PixelDriver::setAllChannelsEnabled(bool enabled) {
+    Lock lock;
     for (auto& ch : channels_) {
         ch->setEnabled(enabled);
     }
 }
 
 uint32_t PixelDriver::getTotalCurrentConsumption() {
+    Lock lock;
     uint32_t total = 0;
     for (const auto& ch : channels_) {
         total += ch->getCurrentConsumption();
@@ -209,59 +391,91 @@ uint32_t PixelDriver::getTotalCurrentConsumption() {
 }
 
 uint32_t PixelDriver::getScaledCurrentConsumption() {
-    return static_cast<uint32_t>(getTotalCurrentConsumption() * getCurrentScaleFactor());
+    Lock lock;
+    uint32_t total = 0;
+    for (const auto& ch : channels_) {
+        total += ch->getScaledCurrentConsumption();
+    }
+    return total;
 }
 
-float PixelDriver::getCurrentScaleFactor() {
-    if (current_limit_ma_ <= 0) return 1.0f;
+uint32_t PixelDriver::currentLimitScaleQ8() {
+    if (current_limit_ma_ <= 0) return 256;
 
     const uint32_t total = getTotalCurrentConsumption();
     const uint32_t available = (current_limit_ma_ > static_cast<int32_t>(SYSTEM_RESERVE_MA))
-        ? (current_limit_ma_ - SYSTEM_RESERVE_MA) : 0;
+        ? (static_cast<uint32_t>(current_limit_ma_) - SYSTEM_RESERVE_MA) : 0;
 
-    if (total <= available) return 1.0f;
-    if (available == 0) return 0.0f;
+    if (total <= available) return 256;
+    if (available == 0) return 0;
+    return (available * 256u) / total;  // < 256
+}
 
-    return static_cast<float>(available) / static_cast<float>(total);
+float PixelDriver::getCurrentScaleFactor() {
+    Lock lock;
+    return static_cast<float>(currentLimitScaleQ8()) / 256.0f;
 }
 
 void PixelDriver::driverTask(void* param) {
+    (void)param;
     TickType_t last_wake_time = xTaskGetTickCount();
-    const TickType_t update_period = pdMS_TO_TICKS(1000 / update_rate_hz_);
+    const uint32_t rate = update_rate_hz_ ? update_rate_hz_ : 60;
+    TickType_t update_period = pdMS_TO_TICKS(1000 / rate);
+    if (update_period == 0) update_period = 1;
     uint32_t tick = 0;
 
-    while (running_) {
-        // Update effects
-        for (auto& ch : channels_) {
-            if (ch->getEffectConfig().enabled) {
-                effect_engine_->updateEffect(ch.get(), tick);
+    std::vector<PixelChannel::PendingSave> pending_saves;
+
+    while (running_.load(std::memory_order_acquire)) {
+        // Hold the driver lock for the CPU part of the frame: the effect
+        // engine reads each channel's live config and setters on other
+        // tasks reassign its string/mask members; removeChannel destroys
+        // channels. Timed take so a stop() issued by a task that holds the
+        // lock (the app's reconfigure sequence) is observed within a frame.
+        if (tryLockFor(RENDER_LOCK_TIMEOUT)) {
+            if (running_.load(std::memory_order_acquire)) {
+                // Update effects
+                for (auto& ch : channels_) {
+                    if (ch->getEffectConfig().enabled && effect_engine_) {
+                        effect_engine_->updateEffect(ch.get(), tick);
+                    }
+                    else {
+                        auto& buffer = ch->getPixelBuffer();
+                        std::fill(buffer.begin(), buffer.end(), PixelColor::Black());
+                    }
+                }
+
+                // Apply brightness + current limiting and transmit
+                applyCurrentLimiting();
+
+                for (auto& ch : channels_) {
+                    ch->transmit();
+                    // Collect settled config changes; written below, outside
+                    // the lock and the frame.
+                    ch->takeSettledSave(pending_saves);
+                }
+                tick++;
             }
-            else {
-                auto& buffer = ch->getPixelBuffer();
-                std::fill(buffer.begin(), buffer.end(), PixelColor::Black());
+            unlock();
+
+            for (const auto& save : pending_saves) {
+                PixelChannel::writeToNVS(save);
             }
+            pending_saves.clear();
         }
 
-        // Apply current limiting and transmit
-        applyCurrentLimiting();
-
-        for (auto& ch : channels_) {
-            ch->transmit();
-            // Persist effect config changes once they settle (resume on boot)
-            ch->persistIfSettled();
-        }
-
-        tick++;
         vTaskDelayUntil(&last_wake_time, update_period);
     }
 
+    task_alive_.store(false, std::memory_order_release);
+    if (task_exit_sem_) xSemaphoreGive(task_exit_sem_);
     vTaskDelete(nullptr);
 }
 
 void PixelDriver::applyCurrentLimiting() {
-    const float scale = getCurrentScaleFactor();
+    const uint32_t scale_q8 = currentLimitScaleQ8();
     for (auto& ch : channels_) {
-        ch->applyCurrentScaling(scale);
+        ch->applyScalingQ8(scale_q8);
     }
 }
 
@@ -270,8 +484,9 @@ void PixelDriver::applyCurrentLimiting() {
 PixelChannel::PixelChannel(int32_t id, const ChannelConfig& config)
     : id_(id)
     , config_(config)
+    , effect_index_(PixelEffectEngine::kEffectUnknown)
+    , effect_registry_gen_(0)
     , initialized_(false)
-    , terminate_task_(false)
     , bytes_sent_(0) {
 
     // Pre-allocate all buffers
@@ -291,6 +506,7 @@ PixelChannel::PixelChannel(int32_t id, const ChannelConfig& config)
     effect_config_.brightness = 255;
     effect_config_.speed = 5;
     effect_config_.enabled = true;
+    resolveEffect();
 }
 
 PixelChannel::~PixelChannel() {
@@ -304,7 +520,7 @@ bool PixelChannel::initialize() {
     complete_semaphore_ = xSemaphoreCreateBinary();
 
     if (!transmit_semaphore_ || !complete_semaphore_) {
-        ESP_LOGE(TAG, "Failed to create semaphores for channel %ld", id_);
+        ESP_LOGE(TAG, "Failed to create semaphores for channel %ld", static_cast<long>(id_));
         cleanup();
         return false;
     }
@@ -312,26 +528,28 @@ bool PixelChannel::initialize() {
     setupI2S();
 
     if (!i2s_channel_) {
-        ESP_LOGE(TAG, "Failed to setup I2S for channel %ld", id_);
+        ESP_LOGE(TAG, "Failed to setup I2S for channel %ld", static_cast<long>(id_));
         cleanup();
         return false;
     }
 
     char task_name[16];
-    snprintf(task_name, sizeof(task_name), "i2s_%ld", id_);
+    snprintf(task_name, sizeof(task_name), "i2s_%ld", static_cast<long>(id_));
 
+    terminate_task_.store(false);
+    i2s_task_exited_.store(false);
     // 2048 (not 1024): this task enters the I2S driver (channel_write/enable)
-    // and formats ESP_LOGE(esp_err_to_name(...)) on error paths, at the highest
-    // priority where a stack overflow is a hard crash.
-    if (xTaskCreate(i2sTaskWrapper, task_name, 2048, this,
-        configMAX_PRIORITIES - 1, &i2s_task_handle_) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create I2S task for channel %ld", id_);
+    // and formats ESP_LOGE(esp_err_to_name(...)) on error paths.
+    const UBaseType_t prio = std::min<UBaseType_t>(I2S_TASK_PRIORITY, configMAX_PRIORITIES - 1);
+    if (xTaskCreate(i2sTaskWrapper, task_name, 2048, this, prio, &i2s_task_handle_) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create I2S task for channel %ld", static_cast<long>(id_));
+        i2s_task_handle_ = nullptr;
         cleanup();
         return false;
     }
 
     initialized_ = true;
-    ESP_LOGI(TAG, "Channel %ld initialized", id_);
+    ESP_LOGI(TAG, "Channel %ld initialized", static_cast<long>(id_));
     return true;
 }
 
@@ -340,50 +558,94 @@ void PixelChannel::markConfigDirty() noexcept {
     nvs_dirty_.store(true, std::memory_order_release);
 }
 
-void PixelChannel::persistIfSettled() {
-    // Persist once the config has been stable for the settle window. Runs
-    // on the driver task; setters run on API/WS/schedule tasks, hence the
-    // atomics. saveToNVS() reads effect_config_ unlocked - a torn read of
-    // a mid-update config only persists a transiently stale value, which
-    // the next settle-save corrects.
-    constexpr int64_t kSettleUs = 2000000;  // 2s after the last change
-    if (!nvs_dirty_.load(std::memory_order_acquire)) return;
-    if (esp_timer_get_time() - nvs_dirty_at_us_.load(std::memory_order_relaxed) < kSettleUs) return;
-
+bool PixelChannel::takeSettledSave(std::vector<PendingSave>& out) {
+    if (!nvs_dirty_.load(std::memory_order_acquire)) return false;
+    if (esp_timer_get_time() - nvs_dirty_at_us_.load(std::memory_order_relaxed) < NVS_SETTLE_US) return false;
     nvs_dirty_.store(false, std::memory_order_release);
-    saveToNVS();
-    ESP_LOGD(TAG, "Persisted channel %ld effect config", id_);
+    out.push_back(PendingSave{ config_.pin, id_, effect_config_ });
+    return true;
+}
+
+void PixelChannel::persistIfSettled() {
+    std::vector<PendingSave> pending;
+    {
+        PixelDriver::Lock lock;
+        takeSettledSave(pending);
+    }
+    for (const auto& save : pending) writeToNVS(save);
+}
+
+void PixelChannel::flushPendingSave() {
+    if (nvs_dirty_.exchange(false, std::memory_order_acq_rel)) {
+        saveToNVS();
+    }
+}
+
+EffectConfig PixelChannel::getEffectConfigCopy() const {
+    PixelDriver::Lock lock;
+    return effect_config_;
+}
+
+void PixelChannel::resolveEffect() {
+    PixelEffectEngine* engine = PixelDriver::getEffectEngine();
+    if (!engine) {
+        effect_index_ = PixelEffectEngine::kEffectUnknown;
+        effect_registry_gen_ = 0;
+        return;
+    }
+    effect_index_ = engine->resolveEffect(effect_config_.effect);
+    effect_registry_gen_ = engine->registryGeneration();
+}
+
+int PixelChannel::effectIndex(const PixelEffectEngine& engine) {
+    if (effect_registry_gen_ != engine.registryGeneration()) {
+        effect_index_ = engine.resolveEffect(effect_config_.effect);
+        effect_registry_gen_ = engine.registryGeneration();
+    }
+    return effect_index_;
 }
 
 void PixelChannel::setEffect(const EffectConfig& config) {
+    PixelDriver::Lock lock;
     effect_config_ = config;
-    if (!config.mask.empty() && config.mask.size() == config_.pixel_count) {
-        setMask(config.mask);
+    effect_config_.speed = std::clamp(effect_config_.speed, uint8_t(1), uint8_t(10));
+    if (!effect_config_.mask.empty() && effect_config_.mask.size() != config_.pixel_count) {
+        ESP_LOGW(TAG, "Channel %ld: mask size %u != %u pixels, ignoring mask",
+            static_cast<long>(id_), static_cast<unsigned>(effect_config_.mask.size()),
+            static_cast<unsigned>(config_.pixel_count));
+        effect_config_.mask.clear();
     }
+    resolveEffect();
     markConfigDirty();
 }
 
 void PixelChannel::setEffectByID(std::string_view effect_id) {
+    PixelDriver::Lock lock;
     effect_config_.effect = std::string(effect_id);
+    resolveEffect();
     markConfigDirty();
 }
 
 void PixelChannel::setColor(const PixelColor& color) noexcept {
+    PixelDriver::Lock lock;
     effect_config_.color = color;
     markConfigDirty();
 }
 
 void PixelChannel::setBrightness(uint8_t brightness) noexcept {
+    PixelDriver::Lock lock;
     effect_config_.brightness = brightness;
     markConfigDirty();
 }
 
 void PixelChannel::setSpeed(uint8_t speed) noexcept {
+    PixelDriver::Lock lock;
     effect_config_.speed = std::clamp(speed, uint8_t(1), uint8_t(10));
     markConfigDirty();
 }
 
 void PixelChannel::setEnabled(bool enabled) noexcept {
+    PixelDriver::Lock lock;
     effect_config_.enabled = enabled;
     markConfigDirty();
 }
@@ -391,6 +653,7 @@ void PixelChannel::setEnabled(bool enabled) noexcept {
 void PixelChannel::setMask(const std::vector<uint8_t>& mask) {
     if (mask.size() != config_.pixel_count) return;
 
+    PixelDriver::Lock lock;
     if (effect_config_.mask.size() != config_.pixel_count) {
         effect_config_.mask.resize(config_.pixel_count);
     }
@@ -398,6 +661,7 @@ void PixelChannel::setMask(const std::vector<uint8_t>& mask) {
 }
 
 void PixelChannel::clearMask() noexcept {
+    PixelDriver::Lock lock;
     effect_config_.mask.clear();
 }
 
@@ -420,6 +684,7 @@ void PixelChannel::setupI2S() {
     esp_err_t ret = i2s_new_channel(&chan_config, &i2s_channel_, nullptr);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to create I2S channel: %s", esp_err_to_name(ret));
+        i2s_channel_ = nullptr;
         return;
     }
 
@@ -446,27 +711,57 @@ void PixelChannel::setupI2S() {
     }
 }
 
+// Idempotent; also runs for partially-initialised channels (failure paths
+// in initialize()), so every step checks what actually exists.
 void PixelChannel::cleanup() {
-    if (!initialized_) return;
-
-    terminate_task_ = true;
-    if (transmit_semaphore_) {
-        xSemaphoreGive(transmit_semaphore_);
-    }
-
     if (i2s_task_handle_) {
-        for (int i = 0; i < 100 && terminate_task_; ++i) {
+        terminate_task_.store(true, std::memory_order_release);
+        if (transmit_semaphore_) {
+            xSemaphoreGive(transmit_semaphore_);
+        }
+        for (int i = 0; i < 100 && !i2s_task_exited_.load(std::memory_order_acquire); ++i) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
-        if (terminate_task_) {
-            ESP_LOGW(TAG, "I2S task did not terminate gracefully");
+        if (!i2s_task_exited_.load(std::memory_order_acquire)) {
+            // Last resort. The task may die mid-transfer with the channel
+            // running; quiesce the hardware right away so the DMA stops
+            // pulling from a buffer that is about to be freed.
+            ESP_LOGW(TAG, "I2S task for channel %ld did not terminate gracefully, deleting it",
+                static_cast<long>(id_));
             vTaskDelete(i2s_task_handle_);
+            if (i2s_channel_) {
+                esp_err_t ret = i2s_channel_disable(i2s_channel_);
+                if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+                    ESP_LOGW(TAG, "i2s_channel_disable failed: %s", esp_err_to_name(ret));
+                }
+            }
         }
         i2s_task_handle_ = nullptr;
     }
 
     if (i2s_channel_) {
-        i2s_del_channel(i2s_channel_);
+        // Disable (no-op when already disabled), detach the ISR callback so
+        // it can never fire into this object or the semaphore once they are
+        // gone, then delete.
+        esp_err_t ret = i2s_channel_disable(i2s_channel_);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "i2s_channel_disable failed: %s", esp_err_to_name(ret));
+        }
+        i2s_event_callbacks_t none = {
+            .on_recv = nullptr,
+            .on_recv_q_ovf = nullptr,
+            .on_sent = nullptr,
+            .on_send_q_ovf = nullptr,
+        };
+        ret = i2s_channel_register_event_callback(i2s_channel_, &none, nullptr);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to clear I2S callbacks: %s", esp_err_to_name(ret));
+        }
+        ret = i2s_del_channel(i2s_channel_);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "i2s_del_channel failed for channel %ld: %s",
+                static_cast<long>(id_), esp_err_to_name(ret));
+        }
         i2s_channel_ = nullptr;
     }
 
@@ -480,7 +775,8 @@ void PixelChannel::cleanup() {
     }
 
     initialized_ = false;
-    terminate_task_ = false;
+    terminate_task_.store(false, std::memory_order_release);
+    i2s_task_exited_.store(false, std::memory_order_release);
 }
 
 void PixelChannel::convertToI2SBuffer(const std::vector<PixelColor>& pixels) {
@@ -564,106 +860,182 @@ void PixelChannel::transmit() {
     }
 }
 
-uint32_t PixelChannel::getCurrentConsumption() const noexcept {
-    uint32_t total_ma = 0;
-
-    for (const auto& pixel : pixel_buffer_) {
-        total_ma += (pixel.r * PixelDriver::CURRENT_PER_CHANNEL_MA) / 255;
-        total_ma += (pixel.g * PixelDriver::CURRENT_PER_CHANNEL_MA) / 255;
-        total_ma += (pixel.b * PixelDriver::CURRENT_PER_CHANNEL_MA) / 255;
-        if (config_.format == PixelFormat::RGBW || config_.format == PixelFormat::RGBCCT) {
-            total_ma += (pixel.w * PixelDriver::CURRENT_PER_CHANNEL_MA) / 255;
+namespace {
+    uint32_t bufferCurrentMa(const std::vector<PixelColor>& buffer, PixelFormat format) {
+        uint32_t total_ma = 0;
+        for (const auto& pixel : buffer) {
+            total_ma += (pixel.r * PixelDriver::CURRENT_PER_CHANNEL_MA) / 255;
+            total_ma += (pixel.g * PixelDriver::CURRENT_PER_CHANNEL_MA) / 255;
+            total_ma += (pixel.b * PixelDriver::CURRENT_PER_CHANNEL_MA) / 255;
+            if (format == PixelFormat::RGBW || format == PixelFormat::RGBCCT) {
+                total_ma += (pixel.w * PixelDriver::CURRENT_PER_CHANNEL_MA) / 255;
+            }
+            if (format == PixelFormat::RGBCCT) {
+                total_ma += (pixel.cw * PixelDriver::CURRENT_PER_CHANNEL_MA) / 255;
+            }
         }
-        if (config_.format == PixelFormat::RGBCCT) {
-            total_ma += (pixel.cw * PixelDriver::CURRENT_PER_CHANNEL_MA) / 255;
-        }
+        return total_ma;
     }
+} // anonymous namespace
 
-    return total_ma;
+uint32_t PixelChannel::getCurrentConsumption() const noexcept {
+    // Post-brightness, pre-limit: what the limiter has to fit into budget.
+    return (bufferCurrentMa(pixel_buffer_, config_.format) * effect_config_.brightness) / 255;
+}
+
+uint32_t PixelChannel::getScaledCurrentConsumption() const noexcept {
+    return bufferCurrentMa(scaled_buffer_, config_.format);
 }
 
 void PixelChannel::applyCurrentScaling(float scale_factor) {
-    const float brightness_scale = effect_config_.brightness / 255.0f;
-    const float combined_scale = brightness_scale * std::min(scale_factor, 1.0f);
+    const float clamped = std::clamp(scale_factor, 0.0f, 1.0f);
+    applyScalingQ8(static_cast<uint32_t>(clamped * 256.0f + 0.5f));
+}
+
+void PixelChannel::applyScalingQ8(uint32_t limit_q8) {
+    if (limit_q8 > 256) limit_q8 = 256;
+    // brightness (0-255) x limit (0-256) -> 0-256, exact identity at 255/256.
+    const uint32_t combined_q8 = (effect_config_.brightness * limit_q8 + 127) / 255;
 
     for (size_t i = 0; i < pixel_buffer_.size(); ++i) {
         const auto& orig = pixel_buffer_[i];
         scaled_buffer_[i] = PixelColor(
-            static_cast<uint8_t>(orig.r * combined_scale),
-            static_cast<uint8_t>(orig.g * combined_scale),
-            static_cast<uint8_t>(orig.b * combined_scale),
-            static_cast<uint8_t>(orig.w * combined_scale),
-            static_cast<uint8_t>(orig.cw * combined_scale)
+            static_cast<uint8_t>((orig.r * combined_q8) >> 8),
+            static_cast<uint8_t>((orig.g * combined_q8) >> 8),
+            static_cast<uint8_t>((orig.b * combined_q8) >> 8),
+            static_cast<uint8_t>((orig.w * combined_q8) >> 8),
+            static_cast<uint8_t>((orig.cw * combined_q8) >> 8)
         );
     }
 }
 
-void PixelChannel::saveToNVS() const {
+void PixelChannel::writeToNVS(const PendingSave& save) {
     nvs_handle_t handle;
-    char key[16];
-    snprintf(key, sizeof(key), "ch_%ld", id_);
-
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to open NVS for channel %ld", id_);
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open NVS for channel %ld: %s",
+            static_cast<long>(save.id), esp_err_to_name(err));
         return;
     }
 
-    std::string effect_key = std::string(key) + ":eff";
-    std::string color_key = std::string(key) + ":col";
-    std::string bright_key = std::string(key) + ":brt";
-    std::string speed_key = std::string(key) + ":spd";
-    std::string enabled_key = std::string(key) + ":on";
+    char key[16];
+    const EffectConfig& cfg = save.config;
 
-    nvs_set_str(handle, effect_key.c_str(), effect_config_.effect.c_str());
-    nvs_set_blob(handle, color_key.c_str(), &effect_config_.color, sizeof(PixelColor));
-    nvs_set_u8(handle, bright_key.c_str(), effect_config_.brightness);
-    nvs_set_u8(handle, speed_key.c_str(), effect_config_.speed);
-    nvs_set_u8(handle, enabled_key.c_str(), effect_config_.enabled ? 1 : 0);
-
-    nvs_commit(handle);
+    nvsKey(key, sizeof(key), save.pin, "eff");
+    err = nvs_set_str(handle, key, cfg.effect.c_str());
+    if (err == ESP_OK) {
+        nvsKey(key, sizeof(key), save.pin, "col");
+        err = nvs_set_blob(handle, key, &cfg.color, sizeof(PixelColor));
+    }
+    if (err == ESP_OK) {
+        nvsKey(key, sizeof(key), save.pin, "brt");
+        err = nvs_set_u8(handle, key, cfg.brightness);
+    }
+    if (err == ESP_OK) {
+        nvsKey(key, sizeof(key), save.pin, "spd");
+        err = nvs_set_u8(handle, key, cfg.speed);
+    }
+    if (err == ESP_OK) {
+        nvsKey(key, sizeof(key), save.pin, "on");
+        err = nvs_set_u8(handle, key, cfg.enabled ? 1 : 0);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to persist channel %ld (pin %d) settings at %s: %s",
+            static_cast<long>(save.id), static_cast<int>(save.pin), key, esp_err_to_name(err));
+    }
+    else {
+        ESP_LOGD(TAG, "Persisted channel %ld (pin %d) effect config",
+            static_cast<long>(save.id), static_cast<int>(save.pin));
+    }
     nvs_close(handle);
+}
+
+void PixelChannel::saveToNVS() const {
+    PendingSave save{ config_.pin, id_, getEffectConfigCopy() };
+    writeToNVS(save);
 }
 
 void PixelChannel::loadFromNVS() {
     nvs_handle_t handle;
-    char key[16];
-    snprintf(key, sizeof(key), "ch_%ld", id_);
-
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
-        ESP_LOGI(TAG, "No saved config for channel %ld", id_);
+    // READWRITE: a legacy id-keyed record may need migrating.
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        ESP_LOGI(TAG, "No saved config for channel %ld", static_cast<long>(id_));
         return;
     }
 
-    std::string effect_key = std::string(key) + ":eff";
-    std::string color_key = std::string(key) + ":col";
-    std::string bright_key = std::string(key) + ":brt";
-    std::string speed_key = std::string(key) + ":spd";
-    std::string enabled_key = std::string(key) + ":on";
+    // Read one key set (pin-keyed, or the legacy id-keyed layout) into
+    // effect_config_. Returns true if any field was present.
+    auto read_set = [&](bool legacy) {
+        char key[16];
+        bool found = false;
+        auto make_key = [&](const char* suffix) {
+            if (legacy) legacyNvsKey(key, sizeof(key), id_, suffix);
+            else nvsKey(key, sizeof(key), config_.pin, suffix);
+        };
 
-    char effect_str[32] = { 0 };
-    size_t len = sizeof(effect_str);
-    if (nvs_get_str(handle, effect_key.c_str(), effect_str, &len) == ESP_OK) {
-        effect_config_.effect = effect_str;
+        char effect_str[32] = { 0 };
+        size_t len = sizeof(effect_str);
+        make_key("eff");
+        if (nvs_get_str(handle, key, effect_str, &len) == ESP_OK) {
+            effect_config_.effect = effect_str;
+            found = true;
+        }
+
+        PixelColor color;
+        size_t color_size = sizeof(PixelColor);
+        make_key("col");
+        if (nvs_get_blob(handle, key, &color, &color_size) == ESP_OK && color_size == sizeof(PixelColor)) {
+            effect_config_.color = color;
+            found = true;
+        }
+
+        uint8_t val = 0;
+        make_key("brt");
+        if (nvs_get_u8(handle, key, &val) == ESP_OK) {
+            effect_config_.brightness = val;
+            found = true;
+        }
+        make_key("spd");
+        if (nvs_get_u8(handle, key, &val) == ESP_OK) {
+            effect_config_.speed = std::clamp(val, uint8_t(1), uint8_t(10));
+            found = true;
+        }
+        make_key("on");
+        if (nvs_get_u8(handle, key, &val) == ESP_OK) {
+            effect_config_.enabled = (val != 0);
+            found = true;
+        }
+        return found;
+    };
+
+    if (!read_set(false) && read_set(true)) {
+        // One-time migration from the pre-stable-id layout: re-key by pin
+        // and drop the abandoned id-keyed entries.
+        ESP_LOGI(TAG, "Migrating channel %ld settings from id-keyed to pin-keyed (pin %d)",
+            static_cast<long>(id_), static_cast<int>(config_.pin));
+        nvs_close(handle);
+        writeToNVS(PendingSave{ config_.pin, id_, effect_config_ });
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+            char key[16];
+            for (const char* suffix : NVS_SUFFIXES) {
+                legacyNvsKey(key, sizeof(key), id_, suffix);
+                esp_err_t err = nvs_erase_key(handle, key);
+                if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+                    ESP_LOGW(TAG, "nvs_erase_key(%s) failed: %s", key, esp_err_to_name(err));
+                }
+            }
+            nvs_commit(handle);
+            nvs_close(handle);
+        }
+    }
+    else {
+        nvs_close(handle);
     }
 
-    PixelColor color;
-    size_t color_size = sizeof(PixelColor);
-    if (nvs_get_blob(handle, color_key.c_str(), &color, &color_size) == ESP_OK) {
-        effect_config_.color = color;
-    }
-
-    uint8_t val = 0;
-    if (nvs_get_u8(handle, bright_key.c_str(), &val) == ESP_OK) {
-        effect_config_.brightness = val;
-    }
-    if (nvs_get_u8(handle, speed_key.c_str(), &val) == ESP_OK) {
-        effect_config_.speed = val;
-    }
-    if (nvs_get_u8(handle, enabled_key.c_str(), &val) == ESP_OK) {
-        effect_config_.enabled = (val != 0);
-    }
-
-    nvs_close(handle);
+    resolveEffect();
 }
 
 void PixelChannel::i2sTaskWrapper(void* param) {
@@ -673,15 +1045,15 @@ void PixelChannel::i2sTaskWrapper(void* param) {
 void PixelChannel::i2sTask() {
     size_t bytes_written;
 
-    ESP_LOGD(TAG, "I2S task started for channel %ld", id_);
+    ESP_LOGD(TAG, "I2S task started for channel %ld", static_cast<long>(id_));
 
-    while (!terminate_task_) {
+    while (!terminate_task_.load(std::memory_order_acquire)) {
         if (xSemaphoreTake(transmit_semaphore_, portMAX_DELAY) != pdTRUE) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
-        if (terminate_task_) break;
+        if (terminate_task_.load(std::memory_order_acquire)) break;
 
         bytes_sent_ = 0;
 
@@ -708,56 +1080,85 @@ void PixelChannel::i2sTask() {
             }
         }
 
-        xSemaphoreTake(complete_semaphore_, portMAX_DELAY);
+        if (xSemaphoreTake(complete_semaphore_, TRANSMIT_COMPLETE_TIMEOUT) != pdTRUE) {
+            ESP_LOGW(TAG, "I2S transmit completion timed out on channel %ld", static_cast<long>(id_));
+        }
         i2s_channel_disable(i2s_channel_);
     }
 
-    ESP_LOGD(TAG, "I2S task finished for channel %ld", id_);
-    terminate_task_ = false;
+    ESP_LOGD(TAG, "I2S task finished for channel %ld", static_cast<long>(id_));
+    i2s_task_exited_.store(true, std::memory_order_release);
     vTaskDelete(nullptr);
 }
 
 // ============= HTTP API Implementation =============
 
+#if CONFIG_KD_PIXDRIVER_HTTP_API
+
 namespace {
+
+    esp_err_t send_json(httpd_req_t* req, cJSON* root) {
+        if (!root) {
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+        char* json = cJSON_Print(root);
+        cJSON_Delete(root);
+        if (!json) {
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+        httpd_resp_set_type(req, "application/json");
+        esp_err_t ret = httpd_resp_send(req, json, strlen(json));
+        free(json);
+        return ret;
+    }
 
     // Handler to list available effects
     esp_err_t led_effects_list_handler(httpd_req_t* req) {
-        cJSON* root = cJSON_CreateArray();
         PixelEffectEngine* effect_engine = PixelDriver::getEffectEngine();
+        if (!effect_engine) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Driver not initialized");
+            return ESP_FAIL;
+        }
+        cJSON* root = cJSON_CreateArray();
+        if (!root) {
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
         std::vector<PixelEffectEngine::EffectInfo> effects = effect_engine->getAllEffects();
 
-        for (size_t i = 0; i < effects.size(); ++i) {
-            const PixelEffectEngine::EffectInfo* eff = &effects[i];
-            if (eff) {
-                cJSON* obj = cJSON_CreateObject();
-                cJSON_AddStringToObject(obj, "name", eff->display_name.c_str());
-                cJSON_AddStringToObject(obj, "id", eff->id.c_str());
-                cJSON_AddItemToArray(root, obj);
-            }
+        for (const auto& eff : effects) {
+            cJSON* obj = cJSON_CreateObject();
+            if (!obj) continue;
+            cJSON_AddStringToObject(obj, "name", eff.display_name.c_str());
+            cJSON_AddStringToObject(obj, "id", eff.id.c_str());
+            cJSON_AddItemToArray(root, obj);
         }
-        char* json = cJSON_Print(root);
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, json, strlen(json));
-        free(json);
-        cJSON_Delete(root);
-        return ESP_OK;
+        return send_json(req, root);
     }
 
     // Handler to get LED configuration (includes version for WASM sync)
     esp_err_t led_config_get_handler(httpd_req_t* req) {
         cJSON* root = cJSON_CreateObject();
+        if (!root) {
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
 
         // Add version info for WASM bundle synchronization
         cJSON_AddStringToObject(root, "version", PIXDRIVER_GIT_COMMIT);
 
-        cJSON* channels = cJSON_CreateArray();
-        std::vector<int32_t> channel_ids = PixelDriver::getChannelIds();
-        for (size_t i = 0; i < channel_ids.size(); ++i) {
-            const PixelChannel* ch = PixelDriver::getChannel(channel_ids[i]);
-            if (ch) {
-                ChannelConfig config = ch->getConfig();
+        cJSON* channels = cJSON_AddArrayToObject(root, "channels");
+        if (channels) {
+            PixelDriver::Lock lock;  // channel pointers stay valid while held
+            std::vector<int32_t> channel_ids = PixelDriver::getChannelIds();
+            for (size_t i = 0; i < channel_ids.size(); ++i) {
+                const PixelChannel* ch = PixelDriver::getChannel(channel_ids[i]);
+                if (!ch) continue;
+                const ChannelConfig& config = ch->getConfig();
                 cJSON* ch_obj = cJSON_CreateObject();
+                if (!ch_obj) continue;
                 cJSON_AddNumberToObject(ch_obj, "index", i);
                 cJSON_AddNumberToObject(ch_obj, "num_leds", config.pixel_count);
                 const char* type_str = "RGB";
@@ -767,46 +1168,51 @@ namespace {
                 cJSON_AddItemToArray(channels, ch_obj);
             }
         }
-        cJSON_AddItemToObject(root, "channels", channels);
-        char* json = cJSON_Print(root);
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, json, strlen(json));
-        free(json);
-        cJSON_Delete(root);
-        return ESP_OK;
+        return send_json(req, root);
+    }
+
+    int parse_channel_index(httpd_req_t* req) {
+        const char* uri = req->uri;
+        const char* base = "/api/led/channel/";
+        if (strncmp(uri, base, strlen(base)) == 0) {
+            return atoi(uri + strlen(base));
+        }
+        return -1;
     }
 
     // Handler to get a single channel configuration (GET /api/led/channel/*)
     esp_err_t led_channel_get_handler(httpd_req_t* req) {
-        int channel_idx = -1;
-        // Parse from URI path
-        const char* uri = req->uri;
-        const char* base = "/api/led/channel/";
-        if (strncmp(uri, base, strlen(base)) == 0) {
-            channel_idx = atoi(uri + strlen(base));
-        }
+        const int channel_idx = parse_channel_index(req);
         if (channel_idx < 0) {
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid channel index");
             return ESP_FAIL;
         }
-        const PixelChannel* ch = PixelDriver::getChannel(channel_idx);
-        if (!ch) {
-            httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Channel not found");
+        EffectConfig eff;
+        PixelFormat fmt;
+        {
+            PixelDriver::Lock lock;
+            const PixelChannel* ch = PixelDriver::getChannel(channel_idx);
+            if (!ch) {
+                httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Channel not found");
+                return ESP_FAIL;
+            }
+            eff = ch->getEffectConfigCopy();
+            fmt = ch->getConfig().format;
+        }
+        cJSON* ch_obj = cJSON_CreateObject();
+        if (!ch_obj) {
+            httpd_resp_send_500(req);
             return ESP_FAIL;
         }
-        const EffectConfig& eff = ch->getEffectConfig();
-        const PixelFormat fmt = ch->getConfig().format;
-        cJSON* ch_obj = cJSON_CreateObject();
         cJSON_AddStringToObject(ch_obj, "effect_id", eff.effect.c_str());
         cJSON_AddNumberToObject(ch_obj, "brightness", eff.brightness);
         cJSON_AddNumberToObject(ch_obj, "speed", eff.speed);
         cJSON_AddBoolToObject(ch_obj, "on", eff.enabled);
-        // Hex string per the documented LEDChannelState schema. The old {r,g,b}
-        // object matched neither the docs nor the apps (which rendered it as a
-        // black swatch). On RGBW the white channel is an internal detail
-        // (auto-derived by white extraction), so 6-digit RGB is the full
-        // public state there. RGBCCT strips drive both whites explicitly, so
-        // they are exposed as separate w/cw fields (not packed into the hex).
+        // Hex string per the documented LEDChannelState schema. On RGBW the
+        // white channel is an internal detail (auto-derived by white
+        // extraction), so 6-digit RGB is the full public state there. RGBCCT
+        // strips drive both whites explicitly, so they are exposed as
+        // separate w/cw fields (not packed into the hex).
         char color_hex[8];
         snprintf(color_hex, sizeof(color_hex), "#%02x%02x%02x",
             eff.color.r, eff.color.g, eff.color.b);
@@ -815,30 +1221,14 @@ namespace {
             cJSON_AddNumberToObject(ch_obj, "w", eff.color.w);    // warm white
             cJSON_AddNumberToObject(ch_obj, "cw", eff.color.cw);  // cool white
         }
-        char* json = cJSON_Print(ch_obj);
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, json, strlen(json));
-        free(json);
-        cJSON_Delete(ch_obj);
-        return ESP_OK;
+        return send_json(req, ch_obj);
     }
 
     // Handler to configure a channel (POST /api/led/channel/*)
     esp_err_t led_channel_config_handler(httpd_req_t* req) {
-        int channel_idx = -1;
-        // Parse from URI path
-        const char* uri = req->uri;
-        const char* base = "/api/led/channel/";
-        if (strncmp(uri, base, strlen(base)) == 0) {
-            channel_idx = atoi(uri + strlen(base));
-        }
+        const int channel_idx = parse_channel_index(req);
         if (channel_idx < 0) {
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid channel index");
-            return ESP_FAIL;
-        }
-        PixelChannel* ch = PixelDriver::getChannel(channel_idx);
-        if (!ch) {
-            httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Channel not found");
             return ESP_FAIL;
         }
 
@@ -860,16 +1250,24 @@ namespace {
         cJSON* on = cJSON_GetObjectItem(json, "on");
         cJSON* effect_id = cJSON_GetObjectItem(json, "effect_id");
 
+        PixelDriver::Lock lock;  // keep the channel alive across get/set
+        PixelChannel* ch = PixelDriver::getChannel(channel_idx);
+        if (!ch) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Channel not found");
+            return ESP_FAIL;
+        }
+
         // Set effect config
-        EffectConfig eff_cfg = ch->getEffectConfig();
-        if (effect_id && cJSON_IsString(effect_id)) eff_cfg.effect = effect_id->valuestring;
+        EffectConfig eff_cfg = ch->getEffectConfigCopy();
+        if (effect_id && cJSON_IsString(effect_id) && effect_id->valuestring) {
+            eff_cfg.effect = effect_id->valuestring;
+        }
         if (brightness && cJSON_IsNumber(brightness)) eff_cfg.brightness = brightness->valueint;
         if (speed && cJSON_IsNumber(speed)) eff_cfg.speed = speed->valueint;
         if (on && cJSON_IsBool(on)) eff_cfg.enabled = cJSON_IsTrue(on);
-        if (color && cJSON_IsString(color)) {
-            // Documented form: "#rrggbb" (optionally "#rrggbbww"). This is what
-            // the apps send; it used to be silently ignored because only the
-            // legacy object form was parsed.
+        if (color && cJSON_IsString(color) && color->valuestring) {
+            // Documented form: "#rrggbb" (optionally "#rrggbbww").
             const char* s = color->valuestring;
             if (*s == '#') s++;
             unsigned r = 0, g = 0, b = 0, w = 0;
@@ -916,6 +1314,10 @@ namespace {
 } // anonymous namespace
 
 void PixelDriver::attach_api(httpd_handle_t server, uri_register_fn register_fn) {
+    if (!server) {
+        ESP_LOGE(TAG, "attach_api: no server handle");
+        return;
+    }
     if (!register_fn) register_fn = httpd_register_uri_handler;
 
     static httpd_uri_t effects_uri = {
@@ -952,3 +1354,13 @@ void PixelDriver::attach_api(httpd_handle_t server, uri_register_fn register_fn)
 
     ESP_LOGI(TAG, "LED API attached (version: %s)", PIXDRIVER_GIT_COMMIT);
 }
+
+#else  // !CONFIG_KD_PIXDRIVER_HTTP_API
+
+void PixelDriver::attach_api(httpd_handle_t server, uri_register_fn register_fn) {
+    (void)server;
+    (void)register_fn;
+    ESP_LOGW(TAG, "Built-in LED HTTP API disabled (CONFIG_KD_PIXDRIVER_HTTP_API=n); nothing registered");
+}
+
+#endif  // CONFIG_KD_PIXDRIVER_HTTP_API

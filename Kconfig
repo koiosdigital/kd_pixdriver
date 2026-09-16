@@ -1,0 +1,14 @@
+menu "KD Pixel Driver"
+
+    config KD_PIXDRIVER_HTTP_API
+        bool "Register the built-in /api/led HTTP handlers"
+        default n
+        help
+            Compile and register kd_pixdriver's own REST handlers
+            (/api/led/effects, /api/led/config, /api/led/channel/*) when the
+            app calls PixelDriver::attach_api(). Apps that expose their own
+            LED API (Tranquil's main/api/led_api.cpp) leave this off; the
+            handlers and their cJSON dependency are then compiled out and
+            attach_api() is a logging no-op.
+
+endmenu

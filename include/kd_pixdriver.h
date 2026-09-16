@@ -54,7 +54,11 @@ struct EffectConfig {
     bool enabled = true;
     std::vector<uint8_t> mask;
 
-    // Custom effect callback (optional)
+    // Custom effect callback (optional). When set it replaces the registered
+    // effect named by `effect`: called once per frame on the driver task
+    // (under PixelDriver::Lock) with the channel's pixel buffer and the frame
+    // tick. Render at full scale - brightness and current limiting are
+    // applied afterwards by the driver. Must not block.
     std::function<void(std::vector<PixelColor>&, uint32_t)> custom_effect;
 };
 
@@ -63,13 +67,42 @@ public:
     static constexpr uint8_t CURRENT_PER_CHANNEL_MA = 20;
     static constexpr uint32_t SYSTEM_RESERVE_MA = 400;
 
+    /// Recursive RAII lock serialising the channel list and every channel's
+    /// effect config across tasks. Every PixelDriver / PixelChannel entry
+    /// point takes it internally (recursively, so a caller already holding
+    /// it may call them); the driver task holds it for the CPU part of each
+    /// frame (effects, current limiting, I2S encoding) and releases it while
+    /// it sleeps between frames.
+    ///
+    /// Hold it yourself when a raw PixelChannel* from getChannel() must stay
+    /// valid across several calls, or when a stop/remove/add/start sequence
+    /// must be atomic to other tasks. stop() may be called with it held.
+    /// Never take it from an ISR.
+    struct Lock {
+        Lock();
+        ~Lock();
+        Lock(const Lock&) = delete;
+        Lock& operator=(const Lock&) = delete;
+    };
+
     // Initialization
     static void initialize(uint32_t update_rate_hz = 60);
     static void shutdown();
 
-    // Channel management
+    // Channel management. Channel ids are stable: the lowest free id is
+    // reused, so the app's stop -> removeChannel -> addChannel -> start
+    // reconfigure sequence yields the same id and finds the same persisted
+    // settings (which are keyed by the data pin, not the id).
     static int32_t addChannel(const ChannelConfig& config);
-    static bool removeChannel(int32_t channel_id);
+    /// Remove a channel. Persisted effect settings are kept (and a pending
+    /// unsaved change is flushed first) unless persist_forget is true, in
+    /// which case the channel's NVS keys are erased.
+    static bool removeChannel(int32_t channel_id, bool persist_forget = false);
+    /// Erase the persisted effect settings for the strip on `pin`.
+    static bool forgetChannelSettings(gpio_num_t pin);
+    /// Raw pointer valid only while the caller holds PixelDriver::Lock (or
+    /// for the duration of a single call from a task that does not remove
+    /// channels). Prefer getEffectConfigCopy() for reads from other tasks.
     [[nodiscard]] static PixelChannel* getChannel(int32_t channel_id);
     [[nodiscard]] static PixelChannel* getMainChannel();
     [[nodiscard]] static std::vector<int32_t> getChannelIds();
@@ -78,11 +111,18 @@ public:
     // Global settings
     static void setCurrentLimit(int32_t limit_ma);
     [[nodiscard]] static int32_t getCurrentLimit() noexcept;
-    static void setUpdateRate(uint32_t rate_hz);
+    /// Only while stopped (the render period and effect engine are rebuilt).
+    /// False (and no change) if the driver is running or rate_hz is 0.
+    static bool setUpdateRate(uint32_t rate_hz);
     [[nodiscard]] static uint32_t getUpdateRate() noexcept;
 
     // Control
-    static void start();
+    /// False if the driver task could not be created (running_ stays false).
+    static bool start();
+    /// Asks the driver task to exit after its current frame and joins it
+    /// (bounded wait; logs an error and returns if it does not exit in time).
+    /// Safe with PixelDriver::Lock held; from inside an effect callback it
+    /// only flags the task, which exits after the frame.
     static void stop();
     [[nodiscard]] static bool isRunning() noexcept;
 
@@ -92,12 +132,15 @@ public:
     static void setAllChannelsBrightness(uint8_t brightness);
     static void setAllChannelsEnabled(bool enabled);
 
-    // Power management
+    // Power management. Total = what the strips would draw after brightness
+    // but before current limiting (the limiter's input); scaled = what is
+    // actually being driven this frame.
     [[nodiscard]] static uint32_t getTotalCurrentConsumption();
     [[nodiscard]] static uint32_t getScaledCurrentConsumption();
     [[nodiscard]] static float getCurrentScaleFactor();
 
-    // HTTP API
+    // HTTP API (compiled in only with CONFIG_KD_PIXDRIVER_HTTP_API; otherwise
+    // a logging no-op so callers still link).
     // register_fn lets the app route registration through a wrapper (e.g.
     // kd_common_api_register_uri_handler for CORS); defaults to the bare
     // httpd_register_uri_handler.
@@ -112,15 +155,17 @@ private:
 
     static void driverTask(void* param);
     static void applyCurrentLimiting();
+    [[nodiscard]] static uint32_t currentLimitScaleQ8();
 
     static std::vector<std::unique_ptr<PixelChannel>> channels_;
     static std::unique_ptr<PixelEffectEngine> effect_engine_;
     static int32_t main_channel_id_;
     static TaskHandle_t task_handle_;
+    static SemaphoreHandle_t task_exit_sem_;  // given by the driver task as it exits
     static int32_t current_limit_ma_;
     static uint32_t update_rate_hz_;
-    static bool running_;
-    static int32_t next_channel_id_;
+    static std::atomic<bool> running_;     // request: keep rendering
+    static std::atomic<bool> task_alive_;  // the driver task has not exited yet
     static bool initialized_;
 };
 
@@ -129,11 +174,11 @@ public:
     PixelChannel(int32_t id, const ChannelConfig& config);
     ~PixelChannel();
 
-    // Non-copyable, movable
+    // Neither copyable nor movable: the I2S task and ISR hold `this`.
     PixelChannel(const PixelChannel&) = delete;
     PixelChannel& operator=(const PixelChannel&) = delete;
-    PixelChannel(PixelChannel&&) = default;
-    PixelChannel& operator=(PixelChannel&&) = default;
+    PixelChannel(PixelChannel&&) = delete;
+    PixelChannel& operator=(PixelChannel&&) = delete;
 
     // Friend for I2S callback
     friend bool i2s_tx_callback(i2s_chan_handle_t handle, i2s_event_data_t* event, void* user_ctx);
@@ -141,9 +186,16 @@ public:
     // Getters
     [[nodiscard]] int32_t getId() const noexcept { return id_; }
     [[nodiscard]] const ChannelConfig& getConfig() const noexcept { return config_; }
+    /// Live effect config by reference. Only valid while the caller holds
+    /// PixelDriver::Lock or runs inside an effect callback on the driver task
+    /// (which holds the lock for the whole frame). Any other task must use
+    /// getEffectConfigCopy(): the string/mask members are reassigned by the
+    /// setters and a concurrent read would tear.
     [[nodiscard]] const EffectConfig& getEffectConfig() const noexcept { return effect_config_; }
+    /// Snapshot of the effect config taken under PixelDriver::Lock.
+    [[nodiscard]] EffectConfig getEffectConfigCopy() const;
 
-    // Effect control
+    // Effect control (each takes PixelDriver::Lock)
     void setEffect(const EffectConfig& config);
     void setEffectByID(std::string_view effect_id);
     void setColor(const PixelColor& color) noexcept;
@@ -153,28 +205,57 @@ public:
     void setMask(const std::vector<uint8_t>& mask);
     void clearMask() noexcept;
 
-    // Buffer access
+    // Buffer access (driver task / effect callbacks; otherwise hold the lock)
     [[nodiscard]] const std::vector<PixelColor>& getPixelBuffer() const noexcept { return pixel_buffer_; }
     [[nodiscard]] std::vector<PixelColor>& getPixelBuffer() noexcept { return pixel_buffer_; }
 
     // Hardware interface
     bool initialize();
     void transmit();
+    /// mA the strip would draw from the current pixel buffer at the channel's
+    /// brightness, before current limiting (the limiter's input).
     [[nodiscard]] uint32_t getCurrentConsumption() const noexcept;
+    /// mA actually driven this frame (from the scaled buffer).
+    [[nodiscard]] uint32_t getScaledCurrentConsumption() const noexcept;
     void applyCurrentScaling(float scale_factor);
+    /// Integer form: limit_q8 = 256 means no limiting. Brightness is folded
+    /// in here (the only place it is applied).
+    void applyScalingQ8(uint32_t limit_q8);
 
-    // Persistence
+    // Persistence (keyed by the data pin: "ch_p<pin>:<field>")
     void saveToNVS() const;
     void loadFromNVS();
 
-    /// Persist the effect config once it has stopped changing (called from
-    /// the driver task each tick). Debounced so slider drags / rapid API
-    /// calls become one NVS write instead of one per intermediate value.
+    /// Persist the effect config once it has stopped changing. Debounced so
+    /// slider drags / rapid API calls become one NVS write instead of one
+    /// per intermediate value. Call from a task that does NOT hold
+    /// PixelDriver::Lock across the call; the driver task uses
+    /// takeSettledSave() + writeToNVS() so the flash write happens outside
+    /// the frame and the lock.
     void persistIfSettled();
+
+    /// A config copy queued for an NVS write outside the lock.
+    struct PendingSave {
+        gpio_num_t pin;
+        int32_t id;
+        EffectConfig config;
+    };
+    /// Under PixelDriver::Lock: if the config is dirty and has been stable for
+    /// the settle window, clear the dirty flag and append a copy to `out`.
+    bool takeSettledSave(std::vector<PendingSave>& out);
+    static void writeToNVS(const PendingSave& save);
+    /// Write a still-dirty config now (used before the channel goes away).
+    void flushPendingSave();
+
+    /// Effect dispatch index cached from the engine's registry; re-resolved
+    /// when the registry generation changes. Used by PixelEffectEngine.
+    [[nodiscard]] int effectIndex(const PixelEffectEngine& engine);
 
 private:
     /// Mark the effect config as needing persistence (any setter/API write)
     void markConfigDirty() noexcept;
+    /// Resolve effect_config_.effect to an engine index (caller holds the lock)
+    void resolveEffect();
 
     void setupI2S();
     void cleanup();
@@ -185,6 +266,8 @@ private:
     int32_t id_;
     ChannelConfig config_;
     EffectConfig effect_config_;
+    int effect_index_;
+    uint32_t effect_registry_gen_;
 
     std::vector<PixelColor> pixel_buffer_;
     std::vector<PixelColor> scaled_buffer_;
@@ -195,8 +278,9 @@ private:
     SemaphoreHandle_t complete_semaphore_ = nullptr;
     TaskHandle_t i2s_task_handle_ = nullptr;
     bool initialized_ = false;
-    bool terminate_task_ = false;
-    size_t bytes_sent_ = 0;
+    std::atomic<bool> terminate_task_{ false };
+    std::atomic<bool> i2s_task_exited_{ false };
+    volatile size_t bytes_sent_ = 0;
 
     // Deferred NVS persistence: setters (API/WS/schedule tasks) mark dirty,
     // the driver task saves after the config has been stable for a while.
